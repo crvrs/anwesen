@@ -99,7 +99,7 @@ impl Value {
 }
 
 /// Convert a whole [`Frontmatter`] tree to a [`serde_json::Value`] object
-/// suitable for HTTP responses or for Tantivy ingestion.
+/// suitable for HTTP responses.
 #[must_use]
 pub fn frontmatter_to_json(fm: &Frontmatter) -> JsonValue {
     let mut map = JsonMap::new();

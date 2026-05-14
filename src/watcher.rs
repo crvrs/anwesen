@@ -5,8 +5,7 @@
 //! pushed into a Tokio channel; [`run_debouncer`] drains the channel,
 //! classifies events into [`WatchAction`]s, coalesces a 100 ms window's
 //! worth into one [`Batch`], and casts the batch to the `index_writer`
-//! named process for a single Tantivy commit (folds in sie's ANW-12
-//! follow-up #3).
+//! named process for a single [`crate::store::NoteStore`] write.
 //!
 //! See [[ADR-003 Filesystem Change Tracking]] for the event model.
 

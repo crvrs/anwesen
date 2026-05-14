@@ -3,10 +3,10 @@
 //! HTTP layer ([ANW-13] / [ANW-14] / [ANW-15]) for read-one and listing
 //! responses.
 //!
-//! Per [[ADR-002 Tantivy as Frontmatter Index]] / [ANW-11], the daemon
-//! rereads from disk only on a watcher event for that path. The store is
-//! that in-memory cache; the index in [`crate::index`] sits beside it,
-//! shaped for frontmatter queries rather than full-record retrieval.
+//! Per [ANW-11], the daemon rereads from disk only on a watcher event for
+//! that path; this store is that in-memory cache and -- per
+//! [[ADR-009 Reverse ADR-002 In-Memory Evaluation No Tantivy]] -- the sole
+//! authoritative record set both `/notes` and `/query` read from.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};

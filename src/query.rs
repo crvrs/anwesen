@@ -10,13 +10,11 @@
 //! Different field predicates AND together; multiple values under
 //! `__in` / `__all` are comma-separated; unknown operators are `400`.
 //!
-//! v1 evaluates predicates by iterating the in-memory [`NoteStore`] and
-//! applying each [`Predicate::matches`] in turn. The Tantivy index from
-//! [[ADR-002 Tantivy as Frontmatter Index]] is still built and maintained,
-//! but query-time filtering doesn't use it yet. At the documented scale
-//! (low-thousands-of-notes vaults) this is sub-millisecond; migration to a
-//! Tantivy-driven candidate set is a future optimization once a real
-//! consumer pushes throughput.
+//! Predicates are evaluated by iterating the in-memory [`NoteStore`] and
+//! applying each [`Predicate::matches`] in turn. At the documented scale
+//! (low-thousands-of-notes vaults) this is sub-millisecond; see
+//! [[ADR-009 Reverse ADR-002 In-Memory Evaluation No Tantivy]] for the
+//! call to keep evaluation in-memory rather than carrying a Tantivy index.
 
 use chrono::{DateTime, NaiveDate};
 use regex::Regex;

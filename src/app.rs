@@ -5,7 +5,7 @@
 //! RootSupervisor (one_for_one)
 //!   -- vault_scanner       (permanent; startup walk + overflow recovery)
 //!   -- filesystem_watcher  (permanent; restart on inotify error)
-//!   -- index_writer        (permanent; owns the Tantivy IndexWriter)
+//!   -- index_writer        (permanent; owns the `NoteStore` write path)
 //!   -- http_server         (permanent; restart on bind loss)
 //! ```
 //!
@@ -38,7 +38,6 @@ use tokio::task::JoinHandle;
 
 use crate::health::HealthState;
 use crate::http::{self as http_layer, HttpState};
-use crate::index::NoteIndex;
 use crate::store::NoteStore;
 use crate::vault::{self, Note};
 use crate::watcher::run_debouncer;
@@ -145,17 +144,13 @@ impl Application for Anwesen {
 
     async fn start(&self) -> Result<Pid, ExitReason> {
         // Startup order matters: `vault_scanner` casts a `Rebuild` to the
-        // `index_writer` name at the end of its init. Hydra start_link is
+        // `index_writer` name at the end of its init. Hydra `start_link` is
         // synchronous, so we put `index_writer` first to guarantee it is
         // registered and in its message loop before `vault_scanner` runs.
         // The `one_for_one` strategy makes the order irrelevant for restart
-        // semantics, only for the cold-start handshake.
-        //
-        // The cold-start handshake also relies on this order in the other
-        // direction: `index_writer.init` skips the `rescan_now` cast on its
-        // first init (`record_init() == 0`) because `vault_scanner` is
-        // about to run its own startup walk. Reordering these children
-        // would silently break that assumption -- so don't.
+        // semantics, only for the cold-start handshake. After ANW-23 the
+        // writer is restart-recoverable (NoteStore is owned by Anwesen and
+        // outlives the process), so no rescan handshake is needed on init.
         let children = [
             IndexWriter {
                 counters: self.counters.clone(),
@@ -422,10 +417,8 @@ pub enum IndexWriterMessage {
     /// Discard the current index and reindex the given notes. Sent by
     /// `vault_scanner` at startup and after `rescan_now`.
     Rebuild(Vec<Note>),
-    /// Apply one debounce-window's worth of upserts and deletes in a single
-    /// Tantivy commit. Sent by `filesystem_watcher`. Picks up sie's ANW-12
-    /// follow-up #3 (commit batching) before ANW-16's watcher can turn
-    /// per-save events into a hot commit loop.
+    /// Apply one debounce-window's worth of upserts and deletes against
+    /// [`NoteStore`] in a single write. Sent by `filesystem_watcher`.
     Batch(IndexBatch),
     /// Insert-or-replace one note. Retained for direct callers; the watcher
     /// uses `Batch`.
@@ -461,26 +454,23 @@ impl IndexWriter {
                 counters: counters.clone(),
                 store: store.clone(),
                 health: health.clone(),
-                index: None,
             }
             .start_link(GenServerOptions::new().name(INDEX_WRITER_NAME))
         })
     }
 }
 
-/// Runtime state for the [`IndexWriter`] process. Held in a separate struct
-/// so the `Clone`-friendly child-spec form (which doesn't carry the live
-/// `NoteIndex`) stays simple. Mirrors every write into the shared
-/// [`NoteStore`] so the HTTP layer can serve read-one and listing
-/// responses without consulting the index.
+/// Runtime state for the [`IndexWriter`] process. Post-[ANW-23] the
+/// "index" name survives in the supervisor tree and `/health` per
+/// [[ADR-009 Reverse ADR-002 In-Memory Evaluation No Tantivy]]'s naming
+/// call, but the role is now purely a serialized writer into the shared
+/// [`NoteStore`]. No on-process state survives a restart -- `NoteStore`
+/// is owned by `Anwesen` and outlives writer restarts, so no rescan
+/// handshake is needed on init.
 pub(crate) struct IndexWriterState {
     counters: Arc<RestartCounters>,
     store: Arc<NoteStore>,
     health: Arc<HealthState>,
-    /// Created lazily in `init` so a Tantivy construction failure surfaces
-    /// as an `ExitReason` and triggers a supervisor restart, rather than
-    /// poisoning the child spec.
-    index: Option<NoteIndex>,
 }
 
 impl GenServer for IndexWriterState {
@@ -488,70 +478,28 @@ impl GenServer for IndexWriterState {
 
     async fn init(&mut self) -> Result<(), ExitReason> {
         let restart = self.counters.index_writer.record_init();
-        let index = NoteIndex::new()
-            .map_err(|e| ExitReason::from(format!("index_writer: NoteIndex::new failed: {e}")))?;
-        self.index = Some(index);
-
-        if restart > 0 {
-            // Writer-only restart: a fresh empty index has come up while the
-            // watcher keeps streaming batches at it. Ask `vault_scanner` for
-            // a full walk via the same `rescan_now` path the inotify-overflow
-            // recovery uses. Per kaa's pin (ADR-004 amendment 2026-05-14),
-            // rescan upserts are idempotent on path so in-flight watcher
-            // batches converge with the rescan.
-            VaultScanner::cast(
-                Dest::from(VAULT_SCANNER_NAME),
-                VaultScannerMessage::RescanNow,
-            );
-            tracing::info!(
-                restart,
-                "index_writer: init -- rescan_now dispatched to vault_scanner"
-            );
-        } else {
-            tracing::info!(restart, "index_writer: init");
-        }
+        tracing::info!(restart, "index_writer: init");
         Ok(())
     }
 
     async fn handle_cast(&mut self, message: Self::Message) -> Result<(), ExitReason> {
-        let Some(index) = self.index.as_mut() else {
-            return Err(ExitReason::from(
-                "index_writer: handle_cast invoked before init",
-            ));
-        };
         match message {
             IndexWriterMessage::Rebuild(notes) => {
                 let count = notes.len();
-                if let Err(e) = index.rebuild(&notes) {
-                    tracing::error!(error = %e, "index_writer: rebuild failed");
-                    return Err(ExitReason::from(format!("rebuild: {e}")));
-                }
                 self.store.replace(notes);
-                tracing::info!(notes = count, "index_writer: rebuilt");
+                tracing::info!(notes = count, "index_writer: rebuilt store");
             }
             IndexWriterMessage::Batch(batch) => {
                 let (u, d) = (batch.upserts.len(), batch.deletes.len());
-                if let Err(e) = index.apply_batch(&batch.upserts, &batch.deletes) {
-                    tracing::error!(error = %e, "index_writer: batch apply failed");
-                    return Err(ExitReason::from(format!("batch: {e}")));
-                }
                 self.store.apply_batch(batch.upserts, &batch.deletes);
                 tracing::info!(upserts = u, deletes = d, "index_writer: batch applied");
             }
             IndexWriterMessage::Upsert(note) => {
                 let path = note.path.clone();
-                if let Err(e) = index.upsert(&note) {
-                    tracing::error!(%path, error = %e, "index_writer: upsert failed");
-                    return Err(ExitReason::from(format!("upsert {path}: {e}")));
-                }
                 self.store.upsert(*note);
                 tracing::debug!(%path, "index_writer: upserted");
             }
             IndexWriterMessage::Delete(path) => {
-                if let Err(e) = index.delete(&path) {
-                    tracing::error!(%path, error = %e, "index_writer: delete failed");
-                    return Err(ExitReason::from(format!("delete {path}: {e}")));
-                }
                 self.store.delete(&path);
                 tracing::debug!(%path, "index_writer: deleted");
             }
