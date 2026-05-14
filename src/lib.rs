@@ -1,0 +1,7 @@
+//! Anwesen: read-only HTTP daemon over a markdown vault.
+//!
+//! The binary in `main.rs` wires this library to a CLI; submodules implement
+//! the vault scanner, the Tantivy index, the filesystem watcher, the
+//! supervisor tree, and the HTTP surface as those issues land.
+
+pub mod vault;
