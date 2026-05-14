@@ -24,6 +24,10 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+use std::path::PathBuf;
+
+use crate::app::RestartCounters;
+use crate::health::HealthState;
 use crate::store::NoteStore;
 use crate::vault::{Note, frontmatter_to_json};
 
@@ -38,6 +42,9 @@ fn rfc3339_z(dt: DateTime<Utc>) -> String {
 #[derive(Clone)]
 pub struct HttpState {
     pub store: Arc<NoteStore>,
+    pub health: Arc<HealthState>,
+    pub restart_counters: Arc<RestartCounters>,
+    pub vault: PathBuf,
 }
 
 pub fn router(state: HttpState) -> Router {
@@ -49,6 +56,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/notes/", get(list_root_folder))
         .route("/notes/{*path}", get(get_notes))
         .route("/query", get(get_query))
+        .route("/health", get(get_health))
         .with_state(state)
 }
 
@@ -99,6 +107,42 @@ async fn get_notes(
 
 async fn list_root_folder(State(state): State<HttpState>) -> Response {
     list_folder(&state, "").into_response()
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    vault_path: String,
+    note_count: usize,
+    last_index_update_ts: Option<String>,
+    last_event_ts: Option<String>,
+    watcher_state: &'static str,
+    in_flight_rescan: bool,
+    supervisor: SupervisorBlock,
+}
+
+#[derive(Debug, Serialize)]
+struct SupervisorBlock {
+    restarts: BTreeMap<&'static str, u32>,
+}
+
+async fn get_health(State(state): State<HttpState>) -> Response {
+    let body = HealthResponse {
+        vault_path: state.vault.to_string_lossy().into_owned(),
+        note_count: state.store.len(),
+        last_index_update_ts: state.health.last_index_update().map(rfc3339_z),
+        last_event_ts: state.health.last_event().map(rfc3339_z),
+        watcher_state: state.health.watcher_state().as_str(),
+        in_flight_rescan: state.health.in_flight_rescan(),
+        supervisor: SupervisorBlock {
+            restarts: state.restart_counters.snapshot(),
+        },
+    };
+    let bytes = serde_json::to_vec(&body).expect("health response serializes");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(bytes))
+        .expect("static response")
 }
 
 async fn get_query(State(state): State<HttpState>, OriginalUri(uri): OriginalUri) -> Response {
@@ -377,6 +421,9 @@ mod tests {
         store.replace(notes);
         let r = router(HttpState {
             store: store.clone(),
+            health: crate::health::HealthState::new(),
+            restart_counters: crate::app::RestartCounters::new(),
+            vault: PathBuf::from("/test/vault"),
         });
         (r, store)
     }

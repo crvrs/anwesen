@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hydra::{Dest, GenServer};
@@ -22,6 +23,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::app::{INDEX_WRITER_NAME, IndexBatch, IndexWriterMessage, IndexWriterState};
 use crate::app::{VAULT_SCANNER_NAME, VaultScanner, VaultScannerMessage};
+use crate::health::HealthState;
 use crate::vault;
 
 /// One path-scoped action derived from a native filesystem event. Always
@@ -183,11 +185,13 @@ pub async fn run_debouncer(
     mut rx: UnboundedReceiver<notify::Result<Event>>,
     vault_root: PathBuf,
     window: Duration,
+    health: Arc<HealthState>,
 ) {
     loop {
         let Some(first) = rx.recv().await else {
             break;
         };
+        health.record_event(chrono::Utc::now());
         let mut events = vec![first];
         let deadline = Instant::now() + window;
         loop {

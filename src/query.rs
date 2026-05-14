@@ -24,7 +24,7 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 
 use crate::store::NoteStore;
-use crate::vault::{Frontmatter, Note, Value, frontmatter_to_json};
+use crate::vault::{Frontmatter, Value, frontmatter_to_json};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum QueryError {
@@ -127,6 +127,21 @@ pub fn parse(raw: &str) -> Result<ParsedQuery, QueryError> {
         }
 
         let (field, op) = split_operator(&key)?;
+        // Pre-validate values whose error-shape is documented per ANW-15 sie
+        // review #4 (regex) and #5 (exists). Surface 400s at parse time
+        // instead of silently zero-matching.
+        match op {
+            Operator::Regex => {
+                Regex::new(&value)
+                    .map_err(|e| QueryError::BadValue(format!("{key}: invalid regex: {e}")))?;
+            }
+            Operator::Exists => {
+                value
+                    .parse::<bool>()
+                    .map_err(|_| QueryError::BadValue(format!("{key}={value}")))?;
+            }
+            _ => {}
+        }
         q.predicates.push(Predicate {
             field: field.to_string(),
             op,
@@ -238,13 +253,17 @@ pub struct QueryResponse {
 }
 
 /// Run a parsed query against the in-memory note set.
+///
+/// Per ANW-15 sie review #6, the per-match clone shed inside the
+/// read-lock closure projects directly into the response shape -- no
+/// `raw_bytes` / `body` copy happens for `/query`.
 pub fn execute<F>(store: &NoteStore, query: &ParsedQuery, format_ts: F) -> QueryResponse
 where
     F: Fn(chrono::DateTime<chrono::Utc>) -> String,
 {
     let prefix = query.path_prefix.as_deref().unwrap_or("");
     let matches = store.with_read(|notes| {
-        let mut out = Vec::new();
+        let mut out: Vec<ResultEntry> = Vec::new();
         for (path, note) in notes {
             if !path_matches(path, prefix, query.recursive) {
                 continue;
@@ -252,27 +271,23 @@ where
             if !predicates_match(&query.predicates, &note.frontmatter) {
                 continue;
             }
-            out.push(note.clone());
+            out.push(ResultEntry {
+                path: note.path.clone(),
+                frontmatter: frontmatter_to_json(&note.frontmatter),
+                last_modified: format_ts(note.last_modified),
+                etag: note.etag.clone(),
+                size: note.size,
+            });
         }
         out
     });
     let total = matches.len();
-    let (results, truncated): (Vec<Note>, bool) = match query.limit {
+    let (results, truncated): (Vec<ResultEntry>, bool) = match query.limit {
         Some(limit) if matches.len() > limit => (matches.into_iter().take(limit).collect(), true),
         _ => (matches, false),
     };
-    let entries = results
-        .into_iter()
-        .map(|n| ResultEntry {
-            path: n.path,
-            frontmatter: frontmatter_to_json(&n.frontmatter),
-            last_modified: format_ts(n.last_modified),
-            etag: n.etag,
-            size: n.size,
-        })
-        .collect();
     QueryResponse {
-        results: entries,
+        results,
         total,
         truncated,
     }
@@ -282,15 +297,18 @@ fn path_matches(path: &str, prefix: &str, recursive: bool) -> bool {
     if prefix.is_empty() {
         return recursive || !path.contains('/');
     }
-    let scoped = match path.strip_prefix(prefix) {
-        Some(rest) => rest.strip_prefix('/').unwrap_or(rest),
-        None => return false,
-    };
-    if scoped.is_empty() {
+    // Anchor the prefix on a segment boundary so `__anw-path=Projects`
+    // doesn't match `Projects-old/x.md`. Fix-pattern matches the folder
+    // listing in ANW-14 (sie's ANW-15 review #3).
+    let scoped = if path == prefix {
         // The prefix itself names a note; consider it in-scope.
-        return true;
-    }
-    if recursive {
+        ""
+    } else if let Some(rest) = path.strip_prefix(&format!("{prefix}/")) {
+        rest
+    } else {
+        return false;
+    };
+    if recursive || scoped.is_empty() {
         true
     } else {
         !scoped.contains('/')
@@ -474,6 +492,8 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use std::collections::BTreeMap;
+
+    use crate::vault::Note;
 
     fn note(path: &str, fm: Frontmatter) -> Note {
         Note {
@@ -677,6 +697,34 @@ mod tests {
         let r = run(&q, &s);
         assert_eq!(r.total, 1);
         assert_eq!(r.results[0].path, "Projects/anwesen/x.md");
+    }
+
+    #[test]
+    fn control_param_path_anchors_on_segment_boundary() {
+        // ANW-22 regression: `Projects` must not match `Projects-old/x.md`.
+        let q = parse("__anw-path=Projects").unwrap();
+        let s = store_with(vec![
+            note("Projects/y.md", fm(&[])),
+            note("Projects-old/x.md", fm(&[])),
+        ]);
+        let r = run(&q, &s);
+        assert_eq!(r.total, 1);
+        assert_eq!(r.results[0].path, "Projects/y.md");
+    }
+
+    #[test]
+    fn regex_invalid_returns_bad_value() {
+        // ANW-15 sie review #4: invalid regex is 400 at parse time, not
+        // silently zero-match at exec time.
+        let err = parse("title__regex=(unclosed").unwrap_err();
+        assert!(matches!(err, QueryError::BadValue(_)));
+    }
+
+    #[test]
+    fn exists_unparseable_bool_returns_bad_value() {
+        // ANW-15 sie review #5: malformed bool is 400, not silent false.
+        let err = parse("deprecated__exists=maybe").unwrap_err();
+        assert!(matches!(err, QueryError::BadValue(_)));
     }
 
     #[test]

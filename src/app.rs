@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::health::HealthState;
 use crate::http::{self as http_layer, HttpState};
 use crate::index::NoteIndex;
 use crate::store::NoteStore;
@@ -114,6 +115,8 @@ pub struct Anwesen {
     /// keeps it current via the writer's batches, and the HTTP layer reads
     /// from it on every request.
     pub store: Arc<NoteStore>,
+    /// Shared mutable health surface consumed by `/health` ([ANW-8]).
+    pub health: Arc<HealthState>,
 }
 
 impl Anwesen {
@@ -124,6 +127,7 @@ impl Anwesen {
             bind,
             counters: RestartCounters::new(),
             store: NoteStore::new(),
+            health: HealthState::new(),
         }
     }
 }
@@ -146,26 +150,37 @@ impl Application for Anwesen {
         // registered and in its message loop before `vault_scanner` runs.
         // The `one_for_one` strategy makes the order irrelevant for restart
         // semantics, only for the cold-start handshake.
+        //
+        // The cold-start handshake also relies on this order in the other
+        // direction: `index_writer.init` skips the `rescan_now` cast on its
+        // first init (`record_init() == 0`) because `vault_scanner` is
+        // about to run its own startup walk. Reordering these children
+        // would silently break that assumption -- so don't.
         let children = [
             IndexWriter {
                 counters: self.counters.clone(),
                 store: self.store.clone(),
+                health: self.health.clone(),
             }
             .child_spec(),
             VaultScanner {
                 vault: self.vault.clone(),
                 counters: self.counters.clone(),
+                health: self.health.clone(),
             }
             .child_spec(),
             FilesystemWatcher {
                 vault: self.vault.clone(),
                 counters: self.counters.clone(),
+                health: self.health.clone(),
             }
             .child_spec(),
             HttpServer {
                 bind: self.bind,
                 counters: self.counters.clone(),
                 store: self.store.clone(),
+                health: self.health.clone(),
+                vault: self.vault.clone(),
             }
             .child_spec(),
         ];
@@ -201,23 +216,30 @@ fn call_not_supported<M>(role: &str) -> Result<Option<M>, ExitReason> {
 pub struct VaultScanner {
     vault: PathBuf,
     counters: Arc<RestartCounters>,
+    health: Arc<HealthState>,
 }
 
 impl VaultScanner {
     fn child_spec(self) -> ChildSpec {
         let counters = self.counters.clone();
         let vault = self.vault.clone();
+        let health = self.health.clone();
         ChildSpec::new(VAULT_SCANNER_NAME).start(move || {
             VaultScanner {
                 vault: vault.clone(),
                 counters: counters.clone(),
+                health: health.clone(),
             }
             .start_link(GenServerOptions::new().name(VAULT_SCANNER_NAME))
         })
     }
 
     fn run_walk(&self) {
+        self.health.set_in_flight_rescan(true);
         let result = vault::scan(&self.vault);
+        // Clear before the cast so a consumer that reads `/health` right
+        // after the cast doesn't see a stale `in_flight_rescan=true`.
+        self.health.set_in_flight_rescan(false);
         tracing::info!(
             notes = result.notes.len(),
             issues = result.issues.len(),
@@ -285,16 +307,19 @@ pub enum FilesystemWatcherMessage {
 pub struct FilesystemWatcher {
     vault: PathBuf,
     counters: Arc<RestartCounters>,
+    health: Arc<HealthState>,
 }
 
 impl FilesystemWatcher {
     fn child_spec(self) -> ChildSpec {
         let counters = self.counters.clone();
         let vault = self.vault.clone();
+        let health = self.health.clone();
         ChildSpec::new(FILESYSTEM_WATCHER_NAME).start(move || {
             FilesystemWatcherState {
                 vault: vault.clone(),
                 counters: counters.clone(),
+                health: health.clone(),
                 watcher: None,
                 debouncer: None,
             }
@@ -310,6 +335,7 @@ impl FilesystemWatcher {
 struct FilesystemWatcherState {
     vault: PathBuf,
     counters: Arc<RestartCounters>,
+    health: Arc<HealthState>,
     watcher: Option<notify::RecommendedWatcher>,
     debouncer: Option<JoinHandle<()>>,
 }
@@ -337,15 +363,33 @@ impl GenServer for FilesystemWatcherState {
             // (process shutdown).
             let _ = tx.send(res);
         })
-        .map_err(|e| ExitReason::from(format!("filesystem_watcher: recommended_watcher: {e}")))?;
+        .map_err(|e| {
+            // Failing to construct the watcher means inotify isn't bound.
+            // Surface the state so /health reflects it before we exit and
+            // let the supervisor restart us.
+            self.health
+                .set_watcher_state(crate::health::WatcherState::Degraded);
+            ExitReason::from(format!("filesystem_watcher: recommended_watcher: {e}"))
+        })?;
         watcher
             .watch(&self.vault, RecursiveMode::Recursive)
-            .map_err(|e| ExitReason::from(format!("filesystem_watcher: watch: {e}")))?;
+            .map_err(|e| {
+                self.health
+                    .set_watcher_state(crate::health::WatcherState::Degraded);
+                ExitReason::from(format!("filesystem_watcher: watch: {e}"))
+            })?;
 
-        let handle = tokio::spawn(run_debouncer(rx, self.vault.clone(), WATCH_DEBOUNCE_WINDOW));
+        let handle = tokio::spawn(run_debouncer(
+            rx,
+            self.vault.clone(),
+            WATCH_DEBOUNCE_WINDOW,
+            self.health.clone(),
+        ));
 
         self.watcher = Some(watcher);
         self.debouncer = Some(handle);
+        self.health
+            .set_watcher_state(crate::health::WatcherState::Running);
 
         tracing::info!(
             restart,
@@ -404,16 +448,19 @@ pub struct IndexBatch {
 pub struct IndexWriter {
     counters: Arc<RestartCounters>,
     store: Arc<NoteStore>,
+    health: Arc<HealthState>,
 }
 
 impl IndexWriter {
     fn child_spec(self) -> ChildSpec {
         let counters = self.counters.clone();
         let store = self.store.clone();
+        let health = self.health.clone();
         ChildSpec::new(INDEX_WRITER_NAME).start(move || {
             IndexWriterState {
                 counters: counters.clone(),
                 store: store.clone(),
+                health: health.clone(),
                 index: None,
             }
             .start_link(GenServerOptions::new().name(INDEX_WRITER_NAME))
@@ -429,6 +476,7 @@ impl IndexWriter {
 pub(crate) struct IndexWriterState {
     counters: Arc<RestartCounters>,
     store: Arc<NoteStore>,
+    health: Arc<HealthState>,
     /// Created lazily in `init` so a Tantivy construction failure surfaces
     /// as an `ExitReason` and triggers a supervisor restart, rather than
     /// poisoning the child spec.
@@ -508,6 +556,7 @@ impl GenServer for IndexWriterState {
                 tracing::debug!(%path, "index_writer: deleted");
             }
         }
+        self.health.record_index_update(chrono::Utc::now());
         Ok(())
     }
 
@@ -521,6 +570,10 @@ impl GenServer for IndexWriterState {
 }
 
 // -- http_server ------------------------------------------------------------
+//
+// The axum binding lands here in ANW-13; the routes follow in /notes,
+// /notes/<folder>/, /query, /health. Updating this comment line when the
+// surface grows so it doesn't quietly drift back into "stub" wording.
 
 /// The HTTP server has no inbound message protocol; the single `Noop`
 /// variant satisfies Hydra's `Receivable` bound.
@@ -534,6 +587,8 @@ pub struct HttpServer {
     bind: SocketAddr,
     counters: Arc<RestartCounters>,
     store: Arc<NoteStore>,
+    health: Arc<HealthState>,
+    vault: PathBuf,
 }
 
 impl HttpServer {
@@ -541,11 +596,16 @@ impl HttpServer {
         let bind = self.bind;
         let counters = self.counters.clone();
         let store = self.store.clone();
+        let health = self.health.clone();
+        let vault = self.vault.clone();
         ChildSpec::new(HTTP_SERVER_NAME).start(move || {
             HttpServerState {
                 bind,
                 counters: counters.clone(),
                 store: store.clone(),
+                health: health.clone(),
+                restart_counters: counters.clone(),
+                vault: vault.clone(),
                 server: None,
             }
             .start_link(GenServerOptions::new().name(HTTP_SERVER_NAME))
@@ -557,6 +617,9 @@ struct HttpServerState {
     bind: SocketAddr,
     counters: Arc<RestartCounters>,
     store: Arc<NoteStore>,
+    health: Arc<HealthState>,
+    restart_counters: Arc<RestartCounters>,
+    vault: PathBuf,
     server: Option<JoinHandle<()>>,
 }
 
@@ -580,6 +643,9 @@ impl GenServer for HttpServerState {
 
         let router = http_layer::router(HttpState {
             store: self.store.clone(),
+            health: self.health.clone(),
+            restart_counters: self.restart_counters.clone(),
+            vault: self.vault.clone(),
         });
         let server = tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, router).await {
