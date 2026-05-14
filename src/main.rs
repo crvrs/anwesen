@@ -40,8 +40,11 @@ fn main() -> Result<()> {
 }
 
 fn init_logging(level: cli::LogLevel) {
-    let filter = tracing_subscriber::EnvFilter::try_from_env("ANWESEN_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level.as_filter_directive()));
+    // The User Manual lists --log-level / ANWESEN_LOG_LEVEL as the only knobs
+    // for verbosity, and pins "CLI flags win over environment variables".
+    // Resolution happens in clap; this function only builds the filter from
+    // the already-resolved level.
+    let filter = tracing_subscriber::EnvFilter::new(level.as_filter_directive());
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

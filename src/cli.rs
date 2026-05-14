@@ -12,6 +12,7 @@
 //! no flags. Each flag has a matching `ANWESEN_<UPPER>` environment variable
 //! and CLI wins over env per the manual.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -41,7 +42,7 @@ pub struct ServeArgs {
 
     /// Listen address for the HTTP server.
     #[arg(long, env = "ANWESEN_BIND", default_value = "127.0.0.1:8080")]
-    pub bind: String,
+    pub bind: SocketAddr,
 
     /// Log verbosity.
     #[arg(long, env = "ANWESEN_LOG_LEVEL", default_value = "info")]
@@ -109,11 +110,17 @@ mod tests {
         match cli.command {
             Command::Serve(a) => {
                 assert_eq!(a.vault, PathBuf::from("/tmp/v"));
-                assert_eq!(a.bind, "0.0.0.0:9000");
+                assert_eq!(a.bind, "0.0.0.0:9000".parse::<SocketAddr>().unwrap());
                 assert!(matches!(a.log_level, LogLevel::Debug));
             }
             _ => panic!("expected serve"),
         }
+    }
+
+    #[test]
+    fn serve_rejects_malformed_bind_at_parse_time() {
+        let err = parse(&["serve", "--vault", "/tmp/v", "--bind", "not-an-addr"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
