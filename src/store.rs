@@ -90,6 +90,20 @@ impl NoteStore {
             .len()
     }
 
+    /// Run `f` with a shared reference to the underlying map. The read lock
+    /// is held for the call; do not run anything that might block on a
+    /// writer here. Used by the folder-listing handler in [`crate::http`].
+    ///
+    /// # Panics
+    /// Panics if the inner `RwLock` has been poisoned.
+    pub fn with_read<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&BTreeMap<String, Note>) -> R,
+    {
+        let guard = self.inner.read().expect("note_store: read lock poisoned");
+        f(&guard)
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0

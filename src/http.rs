@@ -20,7 +20,9 @@ use axum::http::header::{ACCEPT, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 use crate::store::NoteStore;
 use crate::vault::{Note, frontmatter_to_json};
@@ -32,8 +34,13 @@ pub struct HttpState {
 }
 
 pub fn router(state: HttpState) -> Router {
+    // `/notes/{*path}` is greedy and includes any trailing slash; one
+    // handler dispatches read-one vs folder-listing on that suffix. The
+    // root listing (`/notes/`) needs its own route since the wildcard
+    // requires at least one character.
     Router::new()
-        .route("/notes/{*path}", get(get_note))
+        .route("/notes/", get(list_root_folder))
+        .route("/notes/{*path}", get(get_notes))
         .with_state(state)
 }
 
@@ -60,18 +67,30 @@ impl<'a> From<&'a Note> for NoteResponse<'a> {
     }
 }
 
-async fn get_note(
+async fn get_notes(
     State(state): State<HttpState>,
     AxumPath(path): AxumPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    match resolve_path(&path) {
-        Err(reason) => bad_request(reason).into_response(),
-        Ok(canonical) => match state.store.get(&canonical) {
-            None => not_found().into_response(),
-            Some(note) => respond_note(&note, &headers).into_response(),
-        },
+    if path.ends_with('/') {
+        let folder = &path[..path.len() - 1];
+        match resolve_folder(folder) {
+            Err(reason) => bad_request(reason).into_response(),
+            Ok(canonical) => list_folder(&state, &canonical).into_response(),
+        }
+    } else {
+        match resolve_path(&path) {
+            Err(reason) => bad_request(reason).into_response(),
+            Ok(canonical) => match state.store.get(&canonical) {
+                None => not_found().into_response(),
+                Some(note) => respond_note(&note, &headers).into_response(),
+            },
+        }
     }
+}
+
+async fn list_root_folder(State(state): State<HttpState>) -> Response {
+    list_folder(&state, "").into_response()
 }
 
 fn respond_note(note: &Note, headers: &HeaderMap) -> Response {
@@ -137,6 +156,101 @@ fn not_found() -> (StatusCode, &'static str) {
     (StatusCode::NOT_FOUND, "not found\n")
 }
 
+#[derive(Debug, Serialize)]
+struct FolderResponse {
+    path: String,
+    entries: Vec<FolderEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct FolderEntry {
+    name: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    last_modified: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+}
+
+fn list_folder(state: &HttpState, folder: &str) -> Response {
+    let prefix = if folder.is_empty() {
+        String::new()
+    } else {
+        format!("{folder}/")
+    };
+
+    // Two maps: file_name -> (last_modified, size), dir_name -> max(last_modified).
+    let mut files: BTreeMap<String, (DateTime<Utc>, u64)> = BTreeMap::new();
+    let mut dirs: BTreeMap<String, DateTime<Utc>> = BTreeMap::new();
+    let mut found_any = false;
+
+    state.store.with_read(|notes| {
+        for (path, note) in notes {
+            let Some(rel) = path.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            // Empty rel happens if `path == prefix.trim_end_matches('/')`;
+            // BTreeMap iteration with `strip_prefix` won't produce that
+            // (the prefix has a trailing '/'), so a non-empty rel is the
+            // only shape we see here.
+            if rel.is_empty() {
+                continue;
+            }
+            found_any = true;
+            match rel.find('/') {
+                Some(idx) => {
+                    let name = rel[..idx].to_string();
+                    dirs.entry(name)
+                        .and_modify(|t| {
+                            if note.last_modified > *t {
+                                *t = note.last_modified;
+                            }
+                        })
+                        .or_insert(note.last_modified);
+                }
+                None => {
+                    // Leaf file. Scanner already filtered to *.md.
+                    files.insert(rel.to_string(), (note.last_modified, note.size));
+                }
+            }
+        }
+    });
+
+    if !found_any && !folder.is_empty() {
+        return not_found().into_response();
+    }
+
+    let mut entries: Vec<FolderEntry> = Vec::with_capacity(files.len() + dirs.len());
+    for (name, (lm, size)) in files {
+        entries.push(FolderEntry {
+            name,
+            kind: "file",
+            last_modified: lm.to_rfc3339(),
+            size: Some(size),
+        });
+    }
+    for (name, lm) in dirs {
+        entries.push(FolderEntry {
+            name,
+            kind: "dir",
+            last_modified: lm.to_rfc3339(),
+            size: None,
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let body = FolderResponse {
+        path: folder.to_string(),
+        entries,
+    };
+    let bytes = serde_json::to_vec(&body).expect("folder response serializes");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(bytes))
+        .expect("static response")
+}
+
 /// Normalize a request path per the User Manual:
 ///
 /// - URL-decode the entire path once;
@@ -149,6 +263,22 @@ fn resolve_path(raw: &str) -> Result<String, &'static str> {
     let stripped = decoded.trim_start_matches('/').to_string();
     if stripped.is_empty() {
         return Err("path is empty");
+    }
+    for seg in stripped.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return Err("path contains forbidden segment");
+        }
+    }
+    Ok(stripped)
+}
+
+/// Same normalization as [`resolve_path`] but accepts the empty string -- a
+/// folder listing of the vault root via `/notes/`.
+fn resolve_folder(raw: &str) -> Result<String, &'static str> {
+    let decoded = percent_decode(raw).ok_or("invalid percent-encoding")?;
+    let stripped = decoded.trim_start_matches('/').to_string();
+    if stripped.is_empty() {
+        return Ok(String::new());
     }
     for seg in stripped.split('/') {
         if seg.is_empty() || seg == "." || seg == ".." {
@@ -340,6 +470,89 @@ mod tests {
             .unwrap();
         let resp = send(r, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn folder_listing_groups_files_and_dirs() {
+        let notes = vec![
+            note("Projects/a.md", "x"),
+            note("Projects/anwesen/Anwesen.md", "x"),
+            note("Projects/anwesen/User Manual.md", "x"),
+            note("Projects/anwesen/ADR/ADR-001.md", "x"),
+            note("Notes/other.md", "x"),
+        ];
+        let (r, _) = router_with(notes);
+        let req = Request::get("/notes/Projects/anwesen/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = send(r, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["path"], "Projects/anwesen");
+        let entries = v["entries"].as_array().expect("entries array");
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["ADR", "Anwesen.md", "User Manual.md"]);
+        // ADR is the only dir; the other two are files (lex-sorted).
+        assert_eq!(entries[0]["type"], "dir");
+        assert!(entries[0].get("size").is_none());
+        assert_eq!(entries[1]["type"], "file");
+        assert_eq!(entries[1]["size"].as_u64().unwrap(), note("x", "x").size);
+    }
+
+    #[tokio::test]
+    async fn folder_listing_root_lists_top_level() {
+        let notes = vec![
+            note("a.md", "x"),
+            note("Projects/anwesen/x.md", "x"),
+            note("Notes/other.md", "x"),
+        ];
+        let (r, _) = router_with(notes);
+        let req = Request::get("/notes/").body(Body::empty()).unwrap();
+        let resp = send(r, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["path"], "");
+        let names: Vec<&str> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["Notes", "Projects", "a.md"]);
+    }
+
+    #[tokio::test]
+    async fn folder_listing_unknown_returns_404() {
+        let (r, _) = router_with(vec![note("a.md", "x")]);
+        let req = Request::get("/notes/no-such-folder/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = send(r, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn folder_listing_double_dot_rejected_with_400() {
+        let (r, _) = router_with(vec![note("a.md", "x")]);
+        let req = Request::get("/notes/Projects/../etc/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = send(r, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn folder_listing_prefix_does_not_match_partial_segment() {
+        // "Proj" is not a folder; only "Projects" is.
+        let (r, _) = router_with(vec![note("Projects/a.md", "x"), note("Projet/b.md", "x")]);
+        let req = Request::get("/notes/Proj/").body(Body::empty()).unwrap();
+        let resp = send(r, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
