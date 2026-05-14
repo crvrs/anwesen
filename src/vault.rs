@@ -143,7 +143,7 @@ pub struct ScanWarning {
     pub kind: ScanWarningKind,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum ScanWarningKind {
     /// Top-level YAML was syntactically valid but not a mapping
     /// (e.g., a stray top-level list). `serve` keeps the note with an
