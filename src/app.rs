@@ -27,12 +27,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use hydra::{
-    Application, ApplicationConfig, ChildSpec, ExitReason, From as HydraFrom, GenServer,
+    Application, ApplicationConfig, ChildSpec, Dest, ExitReason, From as HydraFrom, GenServer,
     GenServerOptions, Pid, SupervisionStrategy, Supervisor, SupervisorOptions,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::vault;
+use crate::index::NoteIndex;
+use crate::vault::{self, Note};
+
+const INDEX_WRITER_NAME: &str = "index_writer";
 
 /// Snapshot of per-process restart counters. Each role increments its own
 /// counter on every `init` *after the first*, so the count represents
@@ -117,17 +120,23 @@ impl Application for Anwesen {
     }
 
     async fn start(&self) -> Result<Pid, ExitReason> {
+        // Startup order matters: `vault_scanner` casts a `Rebuild` to the
+        // `index_writer` name at the end of its init. Hydra start_link is
+        // synchronous, so we put `index_writer` first to guarantee it is
+        // registered and in its message loop before `vault_scanner` runs.
+        // The `one_for_one` strategy makes the order irrelevant for restart
+        // semantics, only for the cold-start handshake.
         let children = [
+            IndexWriter {
+                counters: self.counters.clone(),
+            }
+            .child_spec(),
             VaultScanner {
                 vault: self.vault.clone(),
                 counters: self.counters.clone(),
             }
             .child_spec(),
             FilesystemWatcher {
-                counters: self.counters.clone(),
-            }
-            .child_spec(),
-            IndexWriter {
                 counters: self.counters.clone(),
             }
             .child_spec(),
@@ -152,6 +161,17 @@ pub enum VaultScannerMessage {
     /// Re-run the startup walk. Sent by `filesystem_watcher` on inotify
     /// overflow recovery per [[ADR-003 Filesystem Change Tracking]].
     RescanNow,
+}
+
+fn call_not_supported<M>(role: &str) -> Result<Option<M>, ExitReason> {
+    // Each role's GenServer trait shares one `Message` type for both call and
+    // cast (Hydra's API shape). To keep a stray `Foo::call(...)` from hanging
+    // forever waiting on a reply, every `handle_call` returns this error.
+    // Sie flagged the silent-Ok(None) pattern in ANW-17 review; pinning it
+    // here in ANW-12 before ANW-16 wires the watcher-to-scanner call.
+    Err(ExitReason::from(format!(
+        "{role} does not handle synchronous calls; use cast"
+    )))
 }
 
 #[derive(Clone)]
@@ -188,6 +208,13 @@ impl VaultScanner {
                 "vault_scanner: skipped file"
             );
         }
+        // Push the fresh record set to the index writer. The cast is
+        // address-by-name so we don't have to thread the index_writer Pid
+        // through child specs.
+        IndexWriterState::cast(
+            Dest::from(INDEX_WRITER_NAME),
+            IndexWriterMessage::Rebuild(result.notes),
+        );
     }
 }
 
@@ -216,8 +243,7 @@ impl GenServer for VaultScanner {
         _message: Self::Message,
         _from: HydraFrom,
     ) -> Result<Option<Self::Message>, ExitReason> {
-        // No synchronous protocol on vault_scanner; ignore.
-        Ok(None)
+        call_not_supported("vault_scanner")
     }
 }
 
@@ -265,17 +291,26 @@ impl GenServer for FilesystemWatcher {
         _message: Self::Message,
         _from: HydraFrom,
     ) -> Result<Option<Self::Message>, ExitReason> {
-        Ok(None)
+        call_not_supported("filesystem_watcher")
     }
 }
 
-// -- index_writer (stub for ANW-12) -----------------------------------------
+// -- index_writer -----------------------------------------------------------
 
+/// Messages handled by the [`IndexWriter`] `GenServer`. All variants are casts
+/// (one-way fire-and-forget); calls return an error from `handle_call`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IndexWriterMessage {
-    /// Placeholder; replaced by index upsert/delete in
-    /// [ANW-12](https://crvrs.youtrack.cloud/issue/ANW-12).
-    Noop,
+    /// Discard the current index and reindex the given notes. Sent by
+    /// `vault_scanner` at startup and after `rescan_now`.
+    Rebuild(Vec<Note>),
+    /// Insert-or-replace one note. Sent by `filesystem_watcher`
+    /// ([ANW-16](https://crvrs.youtrack.cloud/issue/ANW-16)) on
+    /// Create / Move-In / Modify / Close-Write events.
+    Upsert(Box<Note>),
+    /// Drop one note from the index. Sent by `filesystem_watcher` on
+    /// Delete / Move-Out events.
+    Delete(String),
 }
 
 #[derive(Clone)]
@@ -286,25 +321,70 @@ pub struct IndexWriter {
 impl IndexWriter {
     fn child_spec(self) -> ChildSpec {
         let counters = self.counters.clone();
-        ChildSpec::new("index_writer").start(move || {
-            IndexWriter {
+        ChildSpec::new(INDEX_WRITER_NAME).start(move || {
+            IndexWriterState {
                 counters: counters.clone(),
+                index: None,
             }
-            .start_link(GenServerOptions::new().name("index_writer"))
+            .start_link(GenServerOptions::new().name(INDEX_WRITER_NAME))
         })
     }
 }
 
-impl GenServer for IndexWriter {
+/// Runtime state for the [`IndexWriter`] process. Held in a separate struct
+/// so the `Clone`-friendly child-spec form (which doesn't carry the live
+/// `NoteIndex`) stays simple.
+struct IndexWriterState {
+    counters: Arc<RestartCounters>,
+    /// Created lazily in `init` so a Tantivy construction failure surfaces
+    /// as an `ExitReason` and triggers a supervisor restart, rather than
+    /// poisoning the child spec.
+    index: Option<NoteIndex>,
+}
+
+impl GenServer for IndexWriterState {
     type Message = IndexWriterMessage;
 
     async fn init(&mut self) -> Result<(), ExitReason> {
         let restart = self.counters.index_writer.record_init();
-        tracing::info!(restart, "index_writer: init (stub; ANW-12)");
+        let index = NoteIndex::new()
+            .map_err(|e| ExitReason::from(format!("index_writer: NoteIndex::new failed: {e}")))?;
+        self.index = Some(index);
+        tracing::info!(restart, "index_writer: init");
         Ok(())
     }
 
-    async fn handle_cast(&mut self, _message: Self::Message) -> Result<(), ExitReason> {
+    async fn handle_cast(&mut self, message: Self::Message) -> Result<(), ExitReason> {
+        let Some(index) = self.index.as_mut() else {
+            return Err(ExitReason::from(
+                "index_writer: handle_cast invoked before init",
+            ));
+        };
+        match message {
+            IndexWriterMessage::Rebuild(notes) => {
+                let count = notes.len();
+                if let Err(e) = index.rebuild(&notes) {
+                    tracing::error!(error = %e, "index_writer: rebuild failed");
+                    return Err(ExitReason::from(format!("rebuild: {e}")));
+                }
+                tracing::info!(notes = count, "index_writer: rebuilt");
+            }
+            IndexWriterMessage::Upsert(note) => {
+                let path = note.path.clone();
+                if let Err(e) = index.upsert(&note) {
+                    tracing::error!(%path, error = %e, "index_writer: upsert failed");
+                    return Err(ExitReason::from(format!("upsert {path}: {e}")));
+                }
+                tracing::debug!(%path, "index_writer: upserted");
+            }
+            IndexWriterMessage::Delete(path) => {
+                if let Err(e) = index.delete(&path) {
+                    tracing::error!(%path, error = %e, "index_writer: delete failed");
+                    return Err(ExitReason::from(format!("delete {path}: {e}")));
+                }
+                tracing::debug!(%path, "index_writer: deleted");
+            }
+        }
         Ok(())
     }
 
@@ -313,7 +393,7 @@ impl GenServer for IndexWriter {
         _message: Self::Message,
         _from: HydraFrom,
     ) -> Result<Option<Self::Message>, ExitReason> {
-        Ok(None)
+        call_not_supported("index_writer")
     }
 }
 
@@ -351,7 +431,11 @@ impl GenServer for HttpServer {
 
     async fn init(&mut self) -> Result<(), ExitReason> {
         let restart = self.counters.http_server.record_init();
-        tracing::info!(restart, bind = %self.bind, "http_server: init (stub; ANW-13)");
+        tracing::warn!(
+            restart,
+            bind = %self.bind,
+            "http_server: stub -- no port bound yet (real binding lands in ANW-13)"
+        );
         Ok(())
     }
 
@@ -364,7 +448,7 @@ impl GenServer for HttpServer {
         _message: Self::Message,
         _from: HydraFrom,
     ) -> Result<Option<Self::Message>, ExitReason> {
-        Ok(None)
+        call_not_supported("http_server")
     }
 }
 

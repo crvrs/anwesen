@@ -17,23 +17,26 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
-use chrono::{DateTime, FixedOffset, NaiveDate};
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use walkdir::WalkDir;
 
 /// One scanned note. `raw_bytes` is retained so `Accept: text/markdown` can
 /// return the exact bytes that produced `etag` without re-reading from disk
 /// between watcher events ([ANW-13](https://crvrs.youtrack.cloud/issue/ANW-13)).
-#[derive(Debug, Clone)]
+///
+/// Derives `Serialize` / `Deserialize` so the record can flow over Hydra
+/// process messages (see [[ADR-004 Hydra as Process Runtime]]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Note {
     /// Path relative to the vault root, forward-slash separated.
     pub path: String,
     pub frontmatter: Frontmatter,
     pub body: String,
     pub raw_bytes: Vec<u8>,
-    pub last_modified: SystemTime,
+    pub last_modified: DateTime<Utc>,
     pub etag: String,
     pub size: u64,
 }
@@ -42,7 +45,7 @@ pub type Frontmatter = BTreeMap<String, Value>;
 
 /// Frontmatter value with the type-coercion contract from
 /// [[ADR-005 Frontmatter Contract Type Coercion and Cross-Note Shapes]] applied.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -135,7 +138,7 @@ fn read_one(vault_root: &Path, abs_path: &Path) -> Result<Note, ScanIssueKind> {
     let raw_bytes = std::fs::read(abs_path)?;
     let metadata = std::fs::metadata(abs_path)?;
     let size = metadata.len();
-    let last_modified = metadata.modified()?;
+    let last_modified: DateTime<Utc> = metadata.modified()?.into();
     let etag = format!("\"{}\"", blake3::hash(&raw_bytes).to_hex());
 
     let text = std::str::from_utf8(&raw_bytes).map_err(|_| ScanIssueKind::NonUtf8Body)?;

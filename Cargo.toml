@@ -15,7 +15,7 @@ path = "src/main.rs"
 anyhow = "1"
 axum = "0.8"
 blake3 = "1"
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 hydra = "0.1"
 notify = "8"

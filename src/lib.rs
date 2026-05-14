@@ -5,4 +5,5 @@
 //! supervisor tree, and the HTTP surface as those issues land.
 
 pub mod app;
+pub mod index;
 pub mod vault;
