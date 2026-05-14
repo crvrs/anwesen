@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use thiserror::Error;
 use walkdir::WalkDir;
 
@@ -45,6 +46,11 @@ pub type Frontmatter = BTreeMap<String, Value>;
 
 /// Frontmatter value with the type-coercion contract from
 /// [[ADR-005 Frontmatter Contract Type Coercion and Cross-Note Shapes]] applied.
+///
+/// The derived `Serialize` / `Deserialize` is used for Hydra messaging
+/// (binary-format internal transport). HTTP responses must emit the flat,
+/// YAML-natural shape promised by the User Manual; call [`Value::to_json`]
+/// for that.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Null,
@@ -56,6 +62,45 @@ pub enum Value {
     DateTime(DateTime<FixedOffset>),
     Sequence(Vec<Value>),
     Mapping(BTreeMap<String, Value>),
+}
+
+impl Value {
+    /// Convert to a plain [`serde_json::Value`] tree -- the form the User
+    /// Manual promises HTTP consumers (e.g. `"tags": ["a", "b"]` rather than
+    /// `{"Sequence": [{"String": "a"}, ...]}`). Typed dates and datetimes
+    /// emit as their ISO-8601 / RFC 3339 string forms so they sort correctly
+    /// under range queries against the index.
+    #[must_use]
+    pub fn to_json(&self) -> JsonValue {
+        match self {
+            Value::Null => JsonValue::Null,
+            Value::Bool(b) => JsonValue::Bool(*b),
+            Value::Int(i) => json!(i),
+            Value::Float(f) => json!(f),
+            Value::String(s) => JsonValue::String(s.clone()),
+            Value::Date(d) => JsonValue::String(d.format("%Y-%m-%d").to_string()),
+            Value::DateTime(dt) => JsonValue::String(dt.to_rfc3339()),
+            Value::Sequence(seq) => JsonValue::Array(seq.iter().map(Value::to_json).collect()),
+            Value::Mapping(m) => {
+                let mut map = JsonMap::new();
+                for (k, v) in m {
+                    map.insert(k.clone(), v.to_json());
+                }
+                JsonValue::Object(map)
+            }
+        }
+    }
+}
+
+/// Convert a whole [`Frontmatter`] tree to a [`serde_json::Value`] object
+/// suitable for HTTP responses or for Tantivy ingestion.
+#[must_use]
+pub fn frontmatter_to_json(fm: &Frontmatter) -> JsonValue {
+    let mut map = JsonMap::new();
+    for (k, v) in fm {
+        map.insert(k.clone(), v.to_json());
+    }
+    JsonValue::Object(map)
 }
 
 #[derive(Debug)]
@@ -426,5 +471,41 @@ mod tests {
         let (yaml, body) = split_frontmatter("---\nkey: val\nno close here\n");
         assert!(yaml.is_empty());
         assert!(body.starts_with("---\n"));
+    }
+
+    #[test]
+    fn value_to_json_coerces_dates_to_iso_strings() {
+        let d = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        assert_eq!(
+            Value::Date(d).to_json(),
+            JsonValue::String("2026-05-14".into())
+        );
+
+        let dt = DateTime::parse_from_rfc3339("2026-05-14T10:14:22Z").unwrap();
+        assert_eq!(
+            Value::DateTime(dt).to_json(),
+            JsonValue::String("2026-05-14T10:14:22+00:00".into())
+        );
+    }
+
+    #[test]
+    fn value_to_json_emits_flat_yaml_natural_shape() {
+        // The User Manual contract: tags: [a, b] -> JSON ["a", "b"], not the
+        // tagged-enum form `{"Sequence": [{"String": "a"}, ...]}`.
+        let v = Value::Sequence(vec![Value::String("a".into()), Value::String("b".into())]);
+        let j = v.to_json();
+        assert_eq!(j, json!(["a", "b"]));
+    }
+
+    #[test]
+    fn value_to_json_handles_nested_structures() {
+        let mut inner: BTreeMap<String, Value> = BTreeMap::new();
+        inner.insert("name".into(), Value::String("brn".into()));
+        let v = Value::Mapping(inner);
+        let j = v.to_json();
+        let JsonValue::Object(obj) = j else {
+            panic!("expected object");
+        };
+        assert_eq!(obj.get("name"), Some(&JsonValue::String("brn".into())));
     }
 }

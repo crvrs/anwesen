@@ -36,7 +36,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::http::{self as http_layer, HttpState};
 use crate::index::NoteIndex;
+use crate::store::NoteStore;
 use crate::vault::{self, Note};
 use crate::watcher::run_debouncer;
 
@@ -108,6 +110,10 @@ pub struct Anwesen {
     pub vault: PathBuf,
     pub bind: SocketAddr,
     pub counters: Arc<RestartCounters>,
+    /// Shared in-memory note store. The scanner populates it, the watcher
+    /// keeps it current via the writer's batches, and the HTTP layer reads
+    /// from it on every request.
+    pub store: Arc<NoteStore>,
 }
 
 impl Anwesen {
@@ -117,6 +123,7 @@ impl Anwesen {
             vault,
             bind,
             counters: RestartCounters::new(),
+            store: NoteStore::new(),
         }
     }
 }
@@ -142,6 +149,7 @@ impl Application for Anwesen {
         let children = [
             IndexWriter {
                 counters: self.counters.clone(),
+                store: self.store.clone(),
             }
             .child_spec(),
             VaultScanner {
@@ -157,6 +165,7 @@ impl Application for Anwesen {
             HttpServer {
                 bind: self.bind,
                 counters: self.counters.clone(),
+                store: self.store.clone(),
             }
             .child_spec(),
         ];
@@ -394,14 +403,17 @@ pub struct IndexBatch {
 #[derive(Clone)]
 pub struct IndexWriter {
     counters: Arc<RestartCounters>,
+    store: Arc<NoteStore>,
 }
 
 impl IndexWriter {
     fn child_spec(self) -> ChildSpec {
         let counters = self.counters.clone();
+        let store = self.store.clone();
         ChildSpec::new(INDEX_WRITER_NAME).start(move || {
             IndexWriterState {
                 counters: counters.clone(),
+                store: store.clone(),
                 index: None,
             }
             .start_link(GenServerOptions::new().name(INDEX_WRITER_NAME))
@@ -411,9 +423,12 @@ impl IndexWriter {
 
 /// Runtime state for the [`IndexWriter`] process. Held in a separate struct
 /// so the `Clone`-friendly child-spec form (which doesn't carry the live
-/// `NoteIndex`) stays simple.
+/// `NoteIndex`) stays simple. Mirrors every write into the shared
+/// [`NoteStore`] so the HTTP layer can serve read-one and listing
+/// responses without consulting the index.
 pub(crate) struct IndexWriterState {
     counters: Arc<RestartCounters>,
+    store: Arc<NoteStore>,
     /// Created lazily in `init` so a Tantivy construction failure surfaces
     /// as an `ExitReason` and triggers a supervisor restart, rather than
     /// poisoning the child spec.
@@ -445,6 +460,7 @@ impl GenServer for IndexWriterState {
                     tracing::error!(error = %e, "index_writer: rebuild failed");
                     return Err(ExitReason::from(format!("rebuild: {e}")));
                 }
+                self.store.replace(notes);
                 tracing::info!(notes = count, "index_writer: rebuilt");
             }
             IndexWriterMessage::Batch(batch) => {
@@ -453,6 +469,7 @@ impl GenServer for IndexWriterState {
                     tracing::error!(error = %e, "index_writer: batch apply failed");
                     return Err(ExitReason::from(format!("batch: {e}")));
                 }
+                self.store.apply_batch(batch.upserts, &batch.deletes);
                 tracing::info!(upserts = u, deletes = d, "index_writer: batch applied");
             }
             IndexWriterMessage::Upsert(note) => {
@@ -461,6 +478,7 @@ impl GenServer for IndexWriterState {
                     tracing::error!(%path, error = %e, "index_writer: upsert failed");
                     return Err(ExitReason::from(format!("upsert {path}: {e}")));
                 }
+                self.store.upsert(*note);
                 tracing::debug!(%path, "index_writer: upserted");
             }
             IndexWriterMessage::Delete(path) => {
@@ -468,6 +486,7 @@ impl GenServer for IndexWriterState {
                     tracing::error!(%path, error = %e, "index_writer: delete failed");
                     return Err(ExitReason::from(format!("delete {path}: {e}")));
                 }
+                self.store.delete(&path);
                 tracing::debug!(%path, "index_writer: deleted");
             }
         }
@@ -483,12 +502,12 @@ impl GenServer for IndexWriterState {
     }
 }
 
-// -- http_server (stub for ANW-13/14/15) ------------------------------------
+// -- http_server ------------------------------------------------------------
 
+/// The HTTP server has no inbound message protocol; the single `Noop`
+/// variant satisfies Hydra's `Receivable` bound.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HttpServerMessage {
-    /// Placeholder; replaced by the axum surface in
-    /// [ANW-13](https://crvrs.youtrack.cloud/issue/ANW-13) and following.
     Noop,
 }
 
@@ -496,32 +515,62 @@ pub enum HttpServerMessage {
 pub struct HttpServer {
     bind: SocketAddr,
     counters: Arc<RestartCounters>,
+    store: Arc<NoteStore>,
 }
 
 impl HttpServer {
     fn child_spec(self) -> ChildSpec {
         let bind = self.bind;
         let counters = self.counters.clone();
+        let store = self.store.clone();
         ChildSpec::new(HTTP_SERVER_NAME).start(move || {
-            HttpServer {
+            HttpServerState {
                 bind,
                 counters: counters.clone(),
+                store: store.clone(),
+                server: None,
             }
             .start_link(GenServerOptions::new().name(HTTP_SERVER_NAME))
         })
     }
 }
 
-impl GenServer for HttpServer {
+struct HttpServerState {
+    bind: SocketAddr,
+    counters: Arc<RestartCounters>,
+    store: Arc<NoteStore>,
+    server: Option<JoinHandle<()>>,
+}
+
+impl Drop for HttpServerState {
+    fn drop(&mut self) {
+        if let Some(h) = self.server.take() {
+            h.abort();
+        }
+    }
+}
+
+impl GenServer for HttpServerState {
     type Message = HttpServerMessage;
 
     async fn init(&mut self) -> Result<(), ExitReason> {
         let restart = self.counters.http_server.record_init();
-        tracing::warn!(
-            restart,
-            bind = %self.bind,
-            "http_server: stub -- no port bound yet (real binding lands in ANW-13)"
-        );
+
+        let listener = tokio::net::TcpListener::bind(self.bind)
+            .await
+            .map_err(|e| ExitReason::from(format!("http_server: bind {}: {e}", self.bind)))?;
+
+        let router = http_layer::router(HttpState {
+            store: self.store.clone(),
+        });
+        let server = tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, router).await {
+                tracing::error!(error = %e, "http_server: serve loop exited with error");
+            }
+        });
+        self.server = Some(server);
+
+        tracing::info!(restart, bind = %self.bind, "http_server: init");
         Ok(())
     }
 

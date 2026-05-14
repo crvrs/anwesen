@@ -14,11 +14,11 @@
 //! driven from the filesystem watcher in [ANW-16].
 
 use anyhow::{Context, Result};
-use serde_json::{Map as JsonMap, Value as JsonValue, json};
+use serde_json::json;
 use tantivy::schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
 use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 
-use crate::vault::{Note, Value};
+use crate::vault::{Note, frontmatter_to_json};
 
 /// 50 MB heap for the writer. Tantivy's documented minimum is 15 MB; this
 /// sits comfortably above that for low-thousands-of-notes vaults without
@@ -181,37 +181,6 @@ impl NoteIndex {
     }
 }
 
-/// Convert a typed [`Value`] tree to `serde_json::Value`. Typed dates and
-/// datetimes are emitted as their ISO-8601 / RFC 3339 string forms so they
-/// sort correctly under range queries with the `raw` tokenizer.
-fn value_to_json(v: &Value) -> JsonValue {
-    match v {
-        Value::Null => JsonValue::Null,
-        Value::Bool(b) => JsonValue::Bool(*b),
-        Value::Int(i) => json!(i),
-        Value::Float(f) => json!(f),
-        Value::String(s) => JsonValue::String(s.clone()),
-        Value::Date(d) => JsonValue::String(d.format("%Y-%m-%d").to_string()),
-        Value::DateTime(dt) => JsonValue::String(dt.to_rfc3339()),
-        Value::Sequence(seq) => JsonValue::Array(seq.iter().map(value_to_json).collect()),
-        Value::Mapping(m) => {
-            let mut map = JsonMap::new();
-            for (k, v) in m {
-                map.insert(k.clone(), value_to_json(v));
-            }
-            JsonValue::Object(map)
-        }
-    }
-}
-
-fn frontmatter_to_json(fm: &crate::vault::Frontmatter) -> JsonValue {
-    let mut map = JsonMap::new();
-    for (k, v) in fm {
-        map.insert(k.clone(), value_to_json(v));
-    }
-    JsonValue::Object(map)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +188,8 @@ mod tests {
     use std::collections::BTreeMap;
     use tantivy::collector::TopDocs;
     use tantivy::query::TermQuery;
+
+    use crate::vault::Value;
 
     fn sample_note(path: &str, tag: &str) -> Note {
         let mut fm: BTreeMap<String, Value> = BTreeMap::new();
@@ -294,32 +265,5 @@ mod tests {
         idx.upsert(&sample_note("a.md", "x")).unwrap();
         idx.delete("never-indexed.md").unwrap();
         assert_eq!(idx.document_count().unwrap(), 1);
-    }
-
-    #[test]
-    fn value_to_json_coerces_dates_to_iso_strings() {
-        let d = chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
-        assert_eq!(
-            value_to_json(&Value::Date(d)),
-            JsonValue::String("2026-05-14".into())
-        );
-
-        let dt = chrono::DateTime::parse_from_rfc3339("2026-05-14T10:14:22Z").unwrap();
-        assert_eq!(
-            value_to_json(&Value::DateTime(dt)),
-            JsonValue::String("2026-05-14T10:14:22+00:00".into())
-        );
-    }
-
-    #[test]
-    fn value_to_json_handles_nested_structures() {
-        let mut inner: BTreeMap<String, Value> = BTreeMap::new();
-        inner.insert("name".into(), Value::String("brn".into()));
-        let v = Value::Mapping(inner);
-        let j = value_to_json(&v);
-        let JsonValue::Object(obj) = j else {
-            panic!("expected object");
-        };
-        assert_eq!(obj.get("name"), Some(&JsonValue::String("brn".into())));
     }
 }

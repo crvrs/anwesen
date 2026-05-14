@@ -5,6 +5,8 @@
 //! supervisor tree, and the HTTP surface as those issues land.
 
 pub mod app;
+pub mod http;
 pub mod index;
+pub mod store;
 pub mod vault;
 pub mod watcher;
