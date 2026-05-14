@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use thiserror::Error;
@@ -79,7 +79,13 @@ impl Value {
             Value::Float(f) => json!(f),
             Value::String(s) => JsonValue::String(s.clone()),
             Value::Date(d) => JsonValue::String(d.format("%Y-%m-%d").to_string()),
-            Value::DateTime(dt) => JsonValue::String(dt.to_rfc3339()),
+            // Canonicalize to UTC with a `Z` suffix so two notes with the
+            // same instant but different source offsets serialize identically
+            // and compare equal under range queries on the index.
+            Value::DateTime(dt) => JsonValue::String(
+                dt.with_timezone(&Utc)
+                    .to_rfc3339_opts(SecondsFormat::Secs, true),
+            ),
             Value::Sequence(seq) => JsonValue::Array(seq.iter().map(Value::to_json).collect()),
             Value::Mapping(m) => {
                 let mut map = JsonMap::new();
@@ -484,7 +490,13 @@ mod tests {
         let dt = DateTime::parse_from_rfc3339("2026-05-14T10:14:22Z").unwrap();
         assert_eq!(
             Value::DateTime(dt).to_json(),
-            JsonValue::String("2026-05-14T10:14:22+00:00".into())
+            JsonValue::String("2026-05-14T10:14:22Z".into())
+        );
+        // Different source offset, same instant -> same canonical form.
+        let dt2 = DateTime::parse_from_rfc3339("2026-05-14T12:14:22+02:00").unwrap();
+        assert_eq!(
+            Value::DateTime(dt).to_json(),
+            Value::DateTime(dt2).to_json()
         );
     }
 

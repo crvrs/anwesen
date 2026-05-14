@@ -78,6 +78,7 @@ dependencies = [
  "clap",
  "hydra",
  "notify",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",

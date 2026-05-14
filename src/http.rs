@@ -15,17 +15,24 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{OriginalUri, Path as AxumPath, State};
 use axum::http::header::{ACCEPT, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
 use crate::store::NoteStore;
 use crate::vault::{Note, frontmatter_to_json};
+
+/// Canonical RFC 3339 form with a `Z` suffix -- the shape the User Manual
+/// example uses for `last_modified`. Centralized here so every HTTP
+/// `last_modified` field stays in the same dialect.
+fn rfc3339_z(dt: DateTime<Utc>) -> String {
+    dt.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
 
 /// Shared state injected into every handler.
 #[derive(Clone)]
@@ -41,6 +48,7 @@ pub fn router(state: HttpState) -> Router {
     Router::new()
         .route("/notes/", get(list_root_folder))
         .route("/notes/{*path}", get(get_notes))
+        .route("/query", get(get_query))
         .with_state(state)
 }
 
@@ -60,7 +68,7 @@ impl<'a> From<&'a Note> for NoteResponse<'a> {
             path: &note.path,
             frontmatter: frontmatter_to_json(&note.frontmatter),
             body: &note.body,
-            last_modified: note.last_modified.to_rfc3339(),
+            last_modified: rfc3339_z(note.last_modified),
             etag: &note.etag,
             size: note.size,
         }
@@ -91,6 +99,21 @@ async fn get_notes(
 
 async fn list_root_folder(State(state): State<HttpState>) -> Response {
     list_folder(&state, "").into_response()
+}
+
+async fn get_query(State(state): State<HttpState>, OriginalUri(uri): OriginalUri) -> Response {
+    let raw = uri.query().unwrap_or("");
+    let parsed = match crate::query::parse(raw) {
+        Ok(p) => p,
+        Err(e) => return bad_request(&e.to_string()).into_response(),
+    };
+    let resp = crate::query::execute(&state.store, &parsed, rfc3339_z);
+    let bytes = serde_json::to_vec(&resp).expect("query response serializes");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(bytes))
+        .expect("static response")
 }
 
 fn respond_note(note: &Note, headers: &HeaderMap) -> Response {
@@ -225,7 +248,7 @@ fn list_folder(state: &HttpState, folder: &str) -> Response {
         entries.push(FolderEntry {
             name,
             kind: "file",
-            last_modified: lm.to_rfc3339(),
+            last_modified: rfc3339_z(lm),
             size: Some(size),
         });
     }
@@ -233,7 +256,7 @@ fn list_folder(state: &HttpState, folder: &str) -> Response {
         entries.push(FolderEntry {
             name,
             kind: "dir",
-            last_modified: lm.to_rfc3339(),
+            last_modified: rfc3339_z(lm),
             size: None,
         });
     }

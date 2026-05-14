@@ -443,7 +443,25 @@ impl GenServer for IndexWriterState {
         let index = NoteIndex::new()
             .map_err(|e| ExitReason::from(format!("index_writer: NoteIndex::new failed: {e}")))?;
         self.index = Some(index);
-        tracing::info!(restart, "index_writer: init");
+
+        if restart > 0 {
+            // Writer-only restart: a fresh empty index has come up while the
+            // watcher keeps streaming batches at it. Ask `vault_scanner` for
+            // a full walk via the same `rescan_now` path the inotify-overflow
+            // recovery uses. Per kaa's pin (ADR-004 amendment 2026-05-14),
+            // rescan upserts are idempotent on path so in-flight watcher
+            // batches converge with the rescan.
+            VaultScanner::cast(
+                Dest::from(VAULT_SCANNER_NAME),
+                VaultScannerMessage::RescanNow,
+            );
+            tracing::info!(
+                restart,
+                "index_writer: init -- rescan_now dispatched to vault_scanner"
+            );
+        } else {
+            tracing::info!(restart, "index_writer: init");
+        }
         Ok(())
     }
 

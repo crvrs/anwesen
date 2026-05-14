@@ -7,6 +7,7 @@
 pub mod app;
 pub mod http;
 pub mod index;
+pub mod query;
 pub mod store;
 pub mod vault;
 pub mod watcher;
