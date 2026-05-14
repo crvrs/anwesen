@@ -15,12 +15,14 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{OriginalUri, Path as AxumPath, State};
+use axum::extract::{OriginalUri, Path as AxumPath, Request, State};
 use axum::http::header::{ACCEPT, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use chrono::{DateTime, SecondsFormat, Utc};
+use hydra::Process;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -57,7 +59,28 @@ pub fn router(state: HttpState) -> Router {
         .route("/notes/{*path}", get(get_notes))
         .route("/query", get(get_query))
         .route("/health", get(get_health))
+        .layer(from_fn(process_wrap))
         .with_state(state)
+}
+
+/// Per [ANW-25](https://crvrs.youtrack.cloud/issue/ANW-25): run each request
+/// handler inside its own Hydra process via [`Process::spawn`], delivering
+/// the response back through a `oneshot`. A handler panic or abnormal exit
+/// drops the sender, the receiver returns `Err`, and the middleware
+/// surfaces a `500` instead of poisoning the `http_server` process.
+async fn process_wrap(request: Request, next: Next) -> Response {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    Process::spawn(async move {
+        if sender.send(next.run(request).await).is_err() {
+            tracing::error!("process_wrap: response receiver dropped before handler completed");
+        }
+    });
+    if let Ok(response) = receiver.await {
+        response
+    } else {
+        tracing::error!("process_wrap: handler process exited before responding");
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+    }
 }
 
 #[derive(Debug, Serialize)]
