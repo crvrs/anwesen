@@ -29,7 +29,8 @@ use std::time::Duration;
 
 use hydra::{
     Application, ApplicationConfig, ChildSpec, Dest, ExitReason, From as HydraFrom, GenServer,
-    GenServerOptions, Pid, SupervisionStrategy, Supervisor, SupervisorOptions,
+    GenServerOptions, Message, Pid, Process, ProcessFlags, SupervisionStrategy, Supervisor,
+    SupervisorOptions, SystemMessage,
 };
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -519,16 +520,13 @@ impl GenServer for IndexWriterState {
 
 // -- http_server ------------------------------------------------------------
 //
-// The axum binding lands here in ANW-13; the routes follow in /notes,
-// /notes/<folder>/, /query, /health. Updating this comment line when the
-// surface grows so it doesn't quietly drift back into "stub" wording.
-
-/// The HTTP server has no inbound message protocol; the single `Noop`
-/// variant satisfies Hydra's `Receivable` bound.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum HttpServerMessage {
-    Noop,
-}
+// Per [ANW-24](https://crvrs.youtrack.cloud/issue/ANW-24): a plain Hydra
+// process (not a `GenServer`), so axum's serve loop can run on the
+// process's own task and shut down gracefully via
+// `with_graceful_shutdown` when the supervisor sends an exit signal. The
+// `GenServer` machinery added a no-op `Message` enum + a detached
+// `tokio::spawn(serve)` + `Drop::abort()` -- all overhead for a process
+// that has no inbound user protocol.
 
 #[derive(Clone)]
 pub struct HttpServer {
@@ -547,75 +545,61 @@ impl HttpServer {
         let health = self.health.clone();
         let vault = self.vault.clone();
         ChildSpec::new(HTTP_SERVER_NAME).start(move || {
-            HttpServerState {
-                bind,
-                counters: counters.clone(),
-                store: store.clone(),
-                health: health.clone(),
-                restart_counters: counters.clone(),
-                vault: vault.clone(),
-                server: None,
+            let bind = bind;
+            let counters = counters.clone();
+            let store = store.clone();
+            let health = health.clone();
+            let vault = vault.clone();
+            async move {
+                // Bind eagerly so the supervisor sees `bind: <addr>: ...`
+                // as the start error rather than a successful spawn that
+                // exits on its first message.
+                let listener = tokio::net::TcpListener::bind(bind)
+                    .await
+                    .map_err(|e| ExitReason::from(format!("http_server: bind {bind}: {e}")))?;
+                let restart = counters.http_server.record_init();
+                let router = http_layer::router(HttpState {
+                    store,
+                    health,
+                    restart_counters: counters,
+                    vault,
+                });
+                let pid = Process::spawn_link(async move {
+                    Process::set_flags(ProcessFlags::TRAP_EXIT);
+                    tracing::info!(restart, bind = %bind, "http_server: init");
+
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+                    let serve_fut = std::future::IntoFuture::into_future(
+                        axum::serve(listener, router).with_graceful_shutdown(async move {
+                            let _ = shutdown_rx.await;
+                        }),
+                    );
+                    tokio::pin!(serve_fut);
+
+                    tokio::select! {
+                        biased;
+                        msg = Process::receiver().select(|m| {
+                            matches!(m, Message::System(SystemMessage::Exit(_, _)))
+                        }) => {
+                            tracing::info!(?msg, "http_server: shutdown signal received");
+                            let _ = shutdown_tx.send(());
+                            if let Err(e) = (&mut serve_fut).await {
+                                tracing::error!(error = %e, "http_server: serve loop error during shutdown");
+                            }
+                        }
+                        result = &mut serve_fut => {
+                            if let Err(e) = result {
+                                tracing::error!(error = %e, "http_server: serve loop exited with error");
+                            }
+                        }
+                    }
+                });
+                Process::register(pid, HTTP_SERVER_NAME).map_err(|e| {
+                    ExitReason::from(format!("http_server: register: {e:?}"))
+                })?;
+                Ok(pid)
             }
-            .start_link(GenServerOptions::new().name(HTTP_SERVER_NAME))
         })
-    }
-}
-
-struct HttpServerState {
-    bind: SocketAddr,
-    counters: Arc<RestartCounters>,
-    store: Arc<NoteStore>,
-    health: Arc<HealthState>,
-    restart_counters: Arc<RestartCounters>,
-    vault: PathBuf,
-    server: Option<JoinHandle<()>>,
-}
-
-impl Drop for HttpServerState {
-    fn drop(&mut self) {
-        if let Some(h) = self.server.take() {
-            h.abort();
-        }
-    }
-}
-
-impl GenServer for HttpServerState {
-    type Message = HttpServerMessage;
-
-    async fn init(&mut self) -> Result<(), ExitReason> {
-        let restart = self.counters.http_server.record_init();
-
-        let listener = tokio::net::TcpListener::bind(self.bind)
-            .await
-            .map_err(|e| ExitReason::from(format!("http_server: bind {}: {e}", self.bind)))?;
-
-        let router = http_layer::router(HttpState {
-            store: self.store.clone(),
-            health: self.health.clone(),
-            restart_counters: self.restart_counters.clone(),
-            vault: self.vault.clone(),
-        });
-        let server = tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, router).await {
-                tracing::error!(error = %e, "http_server: serve loop exited with error");
-            }
-        });
-        self.server = Some(server);
-
-        tracing::info!(restart, bind = %self.bind, "http_server: init");
-        Ok(())
-    }
-
-    async fn handle_cast(&mut self, _message: Self::Message) -> Result<(), ExitReason> {
-        Ok(())
-    }
-
-    async fn handle_call(
-        &mut self,
-        _message: Self::Message,
-        _from: HydraFrom,
-    ) -> Result<Option<Self::Message>, ExitReason> {
-        call_not_supported("http_server")
     }
 }
 
