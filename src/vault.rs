@@ -114,7 +114,7 @@ pub fn scan(vault_root: &Path) -> ScanResult {
         if !is_markdown(abs_path) {
             continue;
         }
-        match read_one(vault_root, abs_path) {
+        match scan_one(vault_root, abs_path) {
             Ok(note) => notes.push(note),
             Err(kind) => issues.push(ScanIssue {
                 path: abs_path.to_path_buf(),
@@ -134,10 +134,20 @@ fn is_dot_prefixed(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_some_and(|s| s.starts_with('.'))
 }
 
-fn read_one(vault_root: &Path, abs_path: &Path) -> Result<Note, ScanIssueKind> {
+/// Read a single Markdown file off disk and produce its [`Note`]. Used by
+/// [`scan`] and by the filesystem watcher's per-event handler.
+///
+/// # Errors
+/// Returns a [`ScanIssueKind`] when the file cannot be read, the body is not
+/// valid UTF-8, the path itself isn't UTF-8, or the frontmatter YAML fails to
+/// parse.
+pub fn scan_one(vault_root: &Path, abs_path: &Path) -> Result<Note, ScanIssueKind> {
     let raw_bytes = std::fs::read(abs_path)?;
     let metadata = std::fs::metadata(abs_path)?;
-    let size = metadata.len();
+    // Size from the bytes we actually hashed -- avoids the one-frame drift
+    // possible between `read` and `metadata` if the file is rewritten under
+    // us. ETag and size now reflect the same snapshot.
+    let size = raw_bytes.len() as u64;
     let last_modified: DateTime<Utc> = metadata.modified()?.into();
     let etag = format!("\"{}\"", blake3::hash(&raw_bytes).to_hex());
 

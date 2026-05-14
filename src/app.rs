@@ -25,17 +25,30 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 
 use hydra::{
     Application, ApplicationConfig, ChildSpec, Dest, ExitReason, From as HydraFrom, GenServer,
     GenServerOptions, Pid, SupervisionStrategy, Supervisor, SupervisorOptions,
 };
+use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::index::NoteIndex;
 use crate::vault::{self, Note};
+use crate::watcher::run_debouncer;
 
-const INDEX_WRITER_NAME: &str = "index_writer";
+pub(crate) const INDEX_WRITER_NAME: &str = "index_writer";
+pub(crate) const VAULT_SCANNER_NAME: &str = "vault_scanner";
+pub(crate) const FILESYSTEM_WATCHER_NAME: &str = "filesystem_watcher";
+pub(crate) const HTTP_SERVER_NAME: &str = "http_server";
+
+/// Default debounce window for the filesystem watcher. Per [[ADR-003
+/// Filesystem Change Tracking]] -- 100 ms is the documented target, tunable
+/// once real save patterns are observed.
+const WATCH_DEBOUNCE_WINDOW: Duration = Duration::from_millis(100);
 
 /// Snapshot of per-process restart counters. Each role increments its own
 /// counter on every `init` *after the first*, so the count represents
@@ -137,6 +150,7 @@ impl Application for Anwesen {
             }
             .child_spec(),
             FilesystemWatcher {
+                vault: self.vault.clone(),
                 counters: self.counters.clone(),
             }
             .child_spec(),
@@ -184,12 +198,12 @@ impl VaultScanner {
     fn child_spec(self) -> ChildSpec {
         let counters = self.counters.clone();
         let vault = self.vault.clone();
-        ChildSpec::new("vault_scanner").start(move || {
+        ChildSpec::new(VAULT_SCANNER_NAME).start(move || {
             VaultScanner {
                 vault: vault.clone(),
                 counters: counters.clone(),
             }
-            .start_link(GenServerOptions::new().name("vault_scanner"))
+            .start_link(GenServerOptions::new().name(VAULT_SCANNER_NAME))
         })
     }
 
@@ -247,38 +261,89 @@ impl GenServer for VaultScanner {
     }
 }
 
-// -- filesystem_watcher (stub for ANW-16) -----------------------------------
+// -- filesystem_watcher -----------------------------------------------------
 
+/// The watcher accepts no inbound messages today -- its work is the
+/// `notify` stream plus the debouncer task. The single `Noop` variant
+/// satisfies Hydra's `Receivable` bound; once a real call/cast surface is
+/// useful (e.g. for tests) it can be added.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FilesystemWatcherMessage {
-    /// Placeholder so the enum has a variant -- replaced by real watch
-    /// events in [ANW-16](https://crvrs.youtrack.cloud/issue/ANW-16).
     Noop,
 }
 
 #[derive(Clone)]
 pub struct FilesystemWatcher {
+    vault: PathBuf,
     counters: Arc<RestartCounters>,
 }
 
 impl FilesystemWatcher {
     fn child_spec(self) -> ChildSpec {
         let counters = self.counters.clone();
-        ChildSpec::new("filesystem_watcher").start(move || {
-            FilesystemWatcher {
+        let vault = self.vault.clone();
+        ChildSpec::new(FILESYSTEM_WATCHER_NAME).start(move || {
+            FilesystemWatcherState {
+                vault: vault.clone(),
                 counters: counters.clone(),
+                watcher: None,
+                debouncer: None,
             }
-            .start_link(GenServerOptions::new().name("filesystem_watcher"))
+            .start_link(GenServerOptions::new().name(FILESYSTEM_WATCHER_NAME))
         })
     }
 }
 
-impl GenServer for FilesystemWatcher {
+/// Runtime state for the watcher process. Holds the live
+/// [`notify::RecommendedWatcher`] (must outlive event delivery) and the
+/// [`JoinHandle`] for the debouncer task; both are torn down when the
+/// process is dropped on restart.
+struct FilesystemWatcherState {
+    vault: PathBuf,
+    counters: Arc<RestartCounters>,
+    watcher: Option<notify::RecommendedWatcher>,
+    debouncer: Option<JoinHandle<()>>,
+}
+
+impl Drop for FilesystemWatcherState {
+    fn drop(&mut self) {
+        if let Some(h) = self.debouncer.take() {
+            h.abort();
+        }
+        // `watcher` drops on its own, which is enough to stop the inotify
+        // binding; the debouncer task then sees the channel close.
+    }
+}
+
+impl GenServer for FilesystemWatcherState {
     type Message = FilesystemWatcherMessage;
 
     async fn init(&mut self) -> Result<(), ExitReason> {
         let restart = self.counters.filesystem_watcher.record_init();
-        tracing::info!(restart, "filesystem_watcher: init (stub; ANW-16)");
+
+        let (tx, rx) = mpsc::unbounded_channel::<notify::Result<notify::Event>>();
+        let mut watcher = notify::recommended_watcher(move |res| {
+            // Send is non-blocking on an unbounded channel; ignore the
+            // SendError that arises only when the receiver has been dropped
+            // (process shutdown).
+            let _ = tx.send(res);
+        })
+        .map_err(|e| ExitReason::from(format!("filesystem_watcher: recommended_watcher: {e}")))?;
+        watcher
+            .watch(&self.vault, RecursiveMode::Recursive)
+            .map_err(|e| ExitReason::from(format!("filesystem_watcher: watch: {e}")))?;
+
+        let handle = tokio::spawn(run_debouncer(rx, self.vault.clone(), WATCH_DEBOUNCE_WINDOW));
+
+        self.watcher = Some(watcher);
+        self.debouncer = Some(handle);
+
+        tracing::info!(
+            restart,
+            vault = %self.vault.display(),
+            debounce = ?WATCH_DEBOUNCE_WINDOW,
+            "filesystem_watcher: init"
+        );
         Ok(())
     }
 
@@ -304,13 +369,26 @@ pub enum IndexWriterMessage {
     /// Discard the current index and reindex the given notes. Sent by
     /// `vault_scanner` at startup and after `rescan_now`.
     Rebuild(Vec<Note>),
-    /// Insert-or-replace one note. Sent by `filesystem_watcher`
-    /// ([ANW-16](https://crvrs.youtrack.cloud/issue/ANW-16)) on
-    /// Create / Move-In / Modify / Close-Write events.
+    /// Apply one debounce-window's worth of upserts and deletes in a single
+    /// Tantivy commit. Sent by `filesystem_watcher`. Picks up sie's ANW-12
+    /// follow-up #3 (commit batching) before ANW-16's watcher can turn
+    /// per-save events into a hot commit loop.
+    Batch(IndexBatch),
+    /// Insert-or-replace one note. Retained for direct callers; the watcher
+    /// uses `Batch`.
     Upsert(Box<Note>),
-    /// Drop one note from the index. Sent by `filesystem_watcher` on
-    /// Delete / Move-Out events.
+    /// Drop one note from the index. Retained for direct callers; the
+    /// watcher uses `Batch`.
     Delete(String),
+}
+
+/// One batched index update. Deletes apply first so a "delete-then-upsert"
+/// sequence is unambiguous; per-path coalescing in
+/// [`crate::watcher::coalesce`] already keeps at most one action per path.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IndexBatch {
+    pub upserts: Vec<Note>,
+    pub deletes: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -334,7 +412,7 @@ impl IndexWriter {
 /// Runtime state for the [`IndexWriter`] process. Held in a separate struct
 /// so the `Clone`-friendly child-spec form (which doesn't carry the live
 /// `NoteIndex`) stays simple.
-struct IndexWriterState {
+pub(crate) struct IndexWriterState {
     counters: Arc<RestartCounters>,
     /// Created lazily in `init` so a Tantivy construction failure surfaces
     /// as an `ExitReason` and triggers a supervisor restart, rather than
@@ -368,6 +446,14 @@ impl GenServer for IndexWriterState {
                     return Err(ExitReason::from(format!("rebuild: {e}")));
                 }
                 tracing::info!(notes = count, "index_writer: rebuilt");
+            }
+            IndexWriterMessage::Batch(batch) => {
+                let (u, d) = (batch.upserts.len(), batch.deletes.len());
+                if let Err(e) = index.apply_batch(&batch.upserts, &batch.deletes) {
+                    tracing::error!(error = %e, "index_writer: batch apply failed");
+                    return Err(ExitReason::from(format!("batch: {e}")));
+                }
+                tracing::info!(upserts = u, deletes = d, "index_writer: batch applied");
             }
             IndexWriterMessage::Upsert(note) => {
                 let path = note.path.clone();
@@ -416,12 +502,12 @@ impl HttpServer {
     fn child_spec(self) -> ChildSpec {
         let bind = self.bind;
         let counters = self.counters.clone();
-        ChildSpec::new("http_server").start(move || {
+        ChildSpec::new(HTTP_SERVER_NAME).start(move || {
             HttpServer {
                 bind,
                 counters: counters.clone(),
             }
-            .start_link(GenServerOptions::new().name("http_server"))
+            .start_link(GenServerOptions::new().name(HTTP_SERVER_NAME))
         })
     }
 }

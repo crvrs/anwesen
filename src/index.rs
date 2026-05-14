@@ -120,6 +120,25 @@ impl NoteIndex {
         Ok(())
     }
 
+    /// Apply a batch of upserts and deletes in one Tantivy commit. The
+    /// watcher's debouncer dispatches batches per debounce window so a busy
+    /// editor save loop does not produce one commit per event.
+    ///
+    /// # Errors
+    /// Returns the underlying Tantivy error if any add or the final commit
+    /// fails.
+    pub fn apply_batch(&mut self, upserts: &[Note], deletes: &[String]) -> Result<()> {
+        for path in deletes {
+            self.writer.delete_term(self.path_term(path));
+        }
+        for note in upserts {
+            self.writer.delete_term(self.path_term(&note.path));
+            self.add_document(note)?;
+        }
+        self.writer.commit().context("commit batch")?;
+        Ok(())
+    }
+
     /// Number of indexed documents from a fresh reader. Read-only; intended
     /// for tests and the `/health` endpoint ([ANW-8]).
     ///
