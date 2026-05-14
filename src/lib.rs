@@ -4,4 +4,5 @@
 //! the vault scanner, the Tantivy index, the filesystem watcher, the
 //! supervisor tree, and the HTTP surface as those issues land.
 
+pub mod app;
 pub mod vault;

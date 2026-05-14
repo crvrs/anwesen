@@ -5,8 +5,10 @@
 
 mod cli;
 
+use anwesen::app::Anwesen;
 use anyhow::Result;
 use clap::Parser;
+use hydra::Application;
 
 use crate::cli::{Cli, Command};
 
@@ -22,8 +24,10 @@ fn main() -> Result<()> {
             tracing::info!(
                 vault = %args.vault.display(),
                 bind = %args.bind,
-                "anwesen serve: not yet implemented (ANW-10 stub)"
+                "anwesen serve: starting supervisor tree"
             );
+            // Blocks until the supervisor exits (SIGTERM / SIGINT / crash).
+            Anwesen::new(args.vault, args.bind).run();
         }
         Command::Doctor(args) => {
             init_logging(args.log_level);
