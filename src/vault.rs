@@ -112,7 +112,11 @@ pub fn frontmatter_to_json(fm: &Frontmatter) -> JsonValue {
 #[derive(Debug)]
 pub struct ScanResult {
     pub notes: Vec<Note>,
+    /// Hard failures -- file could not be loaded at all.
     pub issues: Vec<ScanIssue>,
+    /// Soft anomalies -- file loaded but flagged for `doctor`. `serve`
+    /// ignores these; ANW-18 surfaces them.
+    pub warnings: Vec<ScanWarning>,
 }
 
 #[derive(Debug)]
@@ -133,11 +137,27 @@ pub enum ScanIssueKind {
     NonUtf8Body,
 }
 
+#[derive(Debug)]
+pub struct ScanWarning {
+    pub path: PathBuf,
+    pub kind: ScanWarningKind,
+}
+
+#[derive(Debug, Error)]
+pub enum ScanWarningKind {
+    /// Top-level YAML was syntactically valid but not a mapping
+    /// (e.g., a stray top-level list). `serve` keeps the note with an
+    /// empty frontmatter; `doctor` reports it.
+    #[error("frontmatter root is not a YAML mapping")]
+    FrontmatterNotMapping,
+}
+
 /// Walk the vault and return every readable Markdown note alongside any
 /// per-file issues. The walk never panics on a single broken file.
 pub fn scan(vault_root: &Path) -> ScanResult {
     let mut notes = Vec::new();
     let mut issues = Vec::new();
+    let mut warnings = Vec::new();
 
     let walker = WalkDir::new(vault_root)
         .follow_links(false)
@@ -165,8 +185,16 @@ pub fn scan(vault_root: &Path) -> ScanResult {
         if !is_markdown(abs_path) {
             continue;
         }
-        match scan_one(vault_root, abs_path) {
-            Ok(note) => notes.push(note),
+        match scan_one_audit(vault_root, abs_path) {
+            Ok((note, maybe_warning)) => {
+                if let Some(kind) = maybe_warning {
+                    warnings.push(ScanWarning {
+                        path: abs_path.to_path_buf(),
+                        kind,
+                    });
+                }
+                notes.push(note);
+            }
             Err(kind) => issues.push(ScanIssue {
                 path: abs_path.to_path_buf(),
                 kind,
@@ -174,7 +202,11 @@ pub fn scan(vault_root: &Path) -> ScanResult {
         }
     }
 
-    ScanResult { notes, issues }
+    ScanResult {
+        notes,
+        issues,
+        warnings,
+    }
 }
 
 fn is_markdown(path: &Path) -> bool {
@@ -186,13 +218,28 @@ fn is_dot_prefixed(name: &std::ffi::OsStr) -> bool {
 }
 
 /// Read a single Markdown file off disk and produce its [`Note`]. Used by
-/// [`scan`] and by the filesystem watcher's per-event handler.
+/// the filesystem watcher's per-event handler -- which discards any
+/// soft-warning surface.
 ///
 /// # Errors
 /// Returns a [`ScanIssueKind`] when the file cannot be read, the body is not
 /// valid UTF-8, the path itself isn't UTF-8, or the frontmatter YAML fails to
 /// parse.
 pub fn scan_one(vault_root: &Path, abs_path: &Path) -> Result<Note, ScanIssueKind> {
+    scan_one_audit(vault_root, abs_path).map(|(note, _)| note)
+}
+
+/// Read a single Markdown file and surface both the [`Note`] and any
+/// soft warning (currently [`ScanWarningKind::FrontmatterNotMapping`]).
+/// Used by [`scan`] so `doctor` can report the diagnostic without
+/// changing what `serve` ingests.
+///
+/// # Errors
+/// Same as [`scan_one`].
+pub fn scan_one_audit(
+    vault_root: &Path,
+    abs_path: &Path,
+) -> Result<(Note, Option<ScanWarningKind>), ScanIssueKind> {
     let raw_bytes = std::fs::read(abs_path)?;
     let metadata = std::fs::metadata(abs_path)?;
     // Size from the bytes we actually hashed -- avoids the one-frame drift
@@ -204,7 +251,7 @@ pub fn scan_one(vault_root: &Path, abs_path: &Path) -> Result<Note, ScanIssueKin
 
     let text = std::str::from_utf8(&raw_bytes).map_err(|_| ScanIssueKind::NonUtf8Body)?;
     let (frontmatter_yaml, body) = split_frontmatter(text);
-    let frontmatter = parse_frontmatter(frontmatter_yaml)?;
+    let (frontmatter, warning) = parse_frontmatter_audit(frontmatter_yaml)?;
 
     let rel = abs_path
         .strip_prefix(vault_root)
@@ -214,15 +261,18 @@ pub fn scan_one(vault_root: &Path, abs_path: &Path) -> Result<Note, ScanIssueKin
     // Normalize separators for HTTP-facing storage; on Linux this is a no-op.
     let path = path.replace('\\', "/");
 
-    Ok(Note {
-        path,
-        frontmatter,
-        body: body.to_string(),
-        raw_bytes,
-        last_modified,
-        etag,
-        size,
-    })
+    Ok((
+        Note {
+            path,
+            frontmatter,
+            body: body.to_string(),
+            raw_bytes,
+            last_modified,
+            etag,
+            size,
+        },
+        warning,
+    ))
 }
 
 /// Split a Markdown source into `(frontmatter_yaml, body)`. The frontmatter
@@ -250,15 +300,21 @@ fn split_frontmatter(src: &str) -> (&str, &str) {
     ("", src)
 }
 
-fn parse_frontmatter(yaml: &str) -> Result<Frontmatter, ScanIssueKind> {
+fn parse_frontmatter_audit(
+    yaml: &str,
+) -> Result<(Frontmatter, Option<ScanWarningKind>), ScanIssueKind> {
     if yaml.trim().is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok((BTreeMap::new(), None));
     }
     let raw: serde_yaml::Value = serde_yaml::from_str(yaml)?;
     // A frontmatter that is not a mapping is not what Obsidian writes;
-    // treat as empty to avoid surfacing a contract surprise to consumers.
+    // serve keeps an empty frontmatter so the note is still served, but
+    // doctor sees the warning so a user can fix the file.
     let serde_yaml::Value::Mapping(map) = raw else {
-        return Ok(BTreeMap::new());
+        return Ok((
+            BTreeMap::new(),
+            Some(ScanWarningKind::FrontmatterNotMapping),
+        ));
     };
     let mut out = BTreeMap::new();
     for (k, v) in map {
@@ -268,7 +324,7 @@ fn parse_frontmatter(yaml: &str) -> Result<Frontmatter, ScanIssueKind> {
         };
         out.insert(key, coerce(v));
     }
-    Ok(out)
+    Ok((out, None))
 }
 
 fn coerce(v: serde_yaml::Value) -> Value {

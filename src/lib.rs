@@ -5,6 +5,7 @@
 //! supervisor tree, and the HTTP surface as those issues land.
 
 pub mod app;
+pub mod doctor;
 pub mod health;
 pub mod http;
 pub mod index;

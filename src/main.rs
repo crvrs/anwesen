@@ -6,6 +6,7 @@
 mod cli;
 
 use anwesen::app::Anwesen;
+use anwesen::doctor;
 use anyhow::Result;
 use clap::Parser;
 use hydra::Application;
@@ -31,10 +32,11 @@ fn main() -> Result<()> {
         }
         Command::Doctor(args) => {
             init_logging(args.log_level);
-            tracing::info!(
-                vault = %args.vault.display(),
-                "anwesen doctor: not yet implemented (ANW-10 stub)"
-            );
+            let (rendered, exit) = doctor::run_and_render(&args.vault);
+            // Render to stdout so the report is pipe-friendly; logs go to
+            // stderr via the tracing subscriber.
+            print!("{rendered}");
+            std::process::exit(exit);
         }
         Command::Version => {
             println!("{}", env!("CARGO_PKG_VERSION"));
