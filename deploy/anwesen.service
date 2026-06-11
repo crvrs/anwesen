@@ -1,0 +1,79 @@
+# Anwesen: read-only HTTP daemon over a markdown vault.
+#
+# Install:
+#   cp target/release/anwesen /usr/local/bin/anwesen
+#   useradd --system --no-create-home --shell /usr/sbin/nologin anwesen
+#   cp deploy/anwesen.service /etc/systemd/system/
+#   systemctl edit anwesen.service     # set the real vault path (see below)
+#   systemctl enable --now anwesen.service
+#   journalctl -u anwesen -f           # structured logs land here
+#
+# Set the vault path and bind address in a drop-in rather than editing this
+# unit, so package updates do not clobber local config:
+#
+#   [Service]
+#   Environment=ANWESEN_VAULT=/srv/vault
+#   ReadOnlyPaths=/srv/vault
+#
+# The vault must be readable (and its directories traversable) by the anwesen
+# user -- grant it via group membership or directory permissions. Anwesen
+# never writes to the vault; ProtectSystem=strict below makes that structural.
+
+[Unit]
+Description=Anwesen read-only HTTP daemon over a markdown vault
+Documentation=https://forge.crvrs.org/carvers/anwesen
+After=network.target
+
+[Service]
+Type=exec
+User=anwesen
+Group=anwesen
+
+# Defaults; override ANWESEN_VAULT (and ReadOnlyPaths) in a drop-in. Anwesen
+# binds 127.0.0.1 by default and trusts every request it accepts -- front it
+# with a reverse proxy for any off-host access (ADR-007, see nginx.example.conf).
+Environment=ANWESEN_VAULT=/srv/vault
+Environment=ANWESEN_BIND=127.0.0.1:8080
+Environment=ANWESEN_LOG_LEVEL=info
+ExecStart=/usr/local/bin/anwesen serve
+
+Restart=on-failure
+RestartSec=2s
+
+# The daemon drains in-flight requests on SIGTERM (systemd's default stop
+# signal). Give it room before SIGKILL.
+TimeoutStopSec=15s
+
+# Structured tracing is written to stderr; route both streams to journald.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=anwesen
+
+# --- Hardening: a read-only daemon that writes nowhere ---
+# ProtectSystem=strict makes the whole filesystem read-only to the service
+# (no ReadWritePaths), so the vault is readable but nothing is writable.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

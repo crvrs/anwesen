@@ -18,6 +18,12 @@ anwesen version
 Each flag has a matching `ANWESEN_<UPPER>` environment variable; CLI wins
 over env.
 
+## Deployment
+
+A systemd unit and an example reverse-proxy config live in [`deploy/`](deploy/).
+Anwesen binds `127.0.0.1` and ships no authentication -- the proxy is the
+access boundary. See [`deploy/README.md`](deploy/README.md).
+
 ## Development
 
 ```
