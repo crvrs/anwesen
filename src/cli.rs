@@ -5,12 +5,13 @@
 //! ```text
 //! anwesen serve  --vault <path> [--bind <addr:port>] [--log-level <level>]
 //! anwesen doctor --vault <path> [--log-level <level>]
+//! anwesen merge  --vault <path> [--query <string>] [--log-level <level>]
 //! anwesen version
 //! ```
 //!
-//! `--bind` is `serve`-only; `doctor` does not bind a port; `version` takes
-//! no flags. Each flag has a matching `ANWESEN_<UPPER>` environment variable
-//! and CLI wins over env per the manual.
+//! `--bind` is `serve`-only; `doctor` and `merge` do not bind a port;
+//! `version` takes no flags. Each flag has a matching `ANWESEN_<UPPER>`
+//! environment variable and CLI wins over env per the manual.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -30,6 +31,9 @@ pub enum Command {
     Serve(ServeArgs),
     /// Walk the vault once and report ingestion blockers. Read-only.
     Doctor(DoctorArgs),
+    /// Walk the vault once, evaluate the query, and write the merged markdown
+    /// document to stdout. One-shot; no server. Read-only.
+    Merge(MergeArgs),
     /// Print the version and exit.
     Version,
 }
@@ -56,6 +60,25 @@ pub struct DoctorArgs {
     pub vault: PathBuf,
 
     /// Log verbosity.
+    #[arg(long, env = "ANWESEN_LOG_LEVEL", default_value = "info")]
+    pub log_level: LogLevel,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct MergeArgs {
+    /// Path to the vault root.
+    #[arg(long, env = "ANWESEN_VAULT")]
+    pub vault: PathBuf,
+
+    /// Query in the `/query` query-string grammar, for example
+    /// `tags=anwesen&__anw-kind=skill&__anw-order=order`. The `__anw-kind`
+    /// homogeneity guard and `__anw-order` fragment ordering ride inside this
+    /// string -- there are no separate flags. Empty merges every note under
+    /// the vault root.
+    #[arg(long, env = "ANWESEN_QUERY", default_value = "")]
+    pub query: String,
+
+    /// Log verbosity. Logs go to stderr; the merged document goes to stdout.
     #[arg(long, env = "ANWESEN_LOG_LEVEL", default_value = "info")]
     pub log_level: LogLevel,
 }
@@ -140,6 +163,51 @@ mod tests {
             }
             _ => panic!("expected doctor"),
         }
+    }
+
+    #[test]
+    fn merge_requires_vault() {
+        assert!(parse(&["merge"]).is_err());
+    }
+
+    #[test]
+    fn merge_query_defaults_to_empty() {
+        let cli = parse(&["merge", "--vault", "/tmp/v"]).expect("parse");
+        match cli.command {
+            Command::Merge(a) => {
+                assert_eq!(a.vault, PathBuf::from("/tmp/v"));
+                assert_eq!(a.query, "");
+            }
+            _ => panic!("expected merge"),
+        }
+    }
+
+    #[test]
+    fn merge_accepts_vault_query_and_log_level() {
+        let cli = parse(&[
+            "merge",
+            "--vault",
+            "/tmp/v",
+            "--query",
+            "tags=anwesen&__anw-order=order",
+            "--log-level",
+            "warn",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Merge(a) => {
+                assert_eq!(a.query, "tags=anwesen&__anw-order=order");
+                assert!(matches!(a.log_level, LogLevel::Warn));
+            }
+            _ => panic!("expected merge"),
+        }
+    }
+
+    #[test]
+    fn merge_rejects_bind() {
+        // --bind is serve-only; merge must not accept it.
+        let err = parse(&["merge", "--vault", "/tmp/v", "--bind", "0.0.0.0:9000"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]

@@ -1,12 +1,13 @@
 //! Anwesen: read-only HTTP daemon over a markdown vault.
 //!
-//! This module wires the CLI to the (still-stub) `serve` and `doctor`
-//! subcommands. The full daemon arrives over [ANW-11..ANW-19].
+//! This module wires the CLI to the `serve`, `doctor`, `merge`, and
+//! `version` subcommands.
 
 mod cli;
 
 use anwesen::app::Anwesen;
 use anwesen::doctor;
+use anwesen::merge;
 use anyhow::Result;
 use clap::Parser;
 use hydra::Application;
@@ -37,6 +38,19 @@ fn main() -> Result<()> {
             // stderr via the tracing subscriber.
             print!("{rendered}");
             std::process::exit(exit);
+        }
+        Command::Merge(args) => {
+            init_logging(args.log_level);
+            match merge::run(&args.vault, &args.query) {
+                // `print!`, not `println!`: the merged document is byte-stable
+                // and byte-identical to the HTTP merge body, which carries no
+                // trailing newline. An empty match set prints nothing, exit 0.
+                Ok(doc) => print!("{doc}"),
+                Err(e) => {
+                    eprint!("{}", e.render());
+                    std::process::exit(1);
+                }
+            }
         }
         Command::Version => {
             println!("{}", env!("CARGO_PKG_VERSION"));
