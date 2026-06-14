@@ -168,12 +168,30 @@ async fn get_health(State(state): State<HttpState>) -> Response {
         .expect("static response")
 }
 
-async fn get_query(State(state): State<HttpState>, OriginalUri(uri): OriginalUri) -> Response {
+async fn get_query(
+    State(state): State<HttpState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
     let raw = uri.query().unwrap_or("");
     let parsed = match crate::query::parse(raw) {
         Ok(p) => p,
         Err(e) => return bad_request(&e.to_string()).into_response(),
     };
+
+    // `Accept: text/markdown` selects merge mode: concatenated note bodies
+    // ([ANW-26]). Without it, `/query` returns the JSON list as before.
+    if wants_markdown(&headers) {
+        return match crate::query::execute_merge(&state.store, &parsed) {
+            Ok(body) => Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/markdown; charset=utf-8")
+                .body(Body::from(body))
+                .expect("static response"),
+            Err(crate::query::MergeError::KindGuard(msg)) => bad_request(&msg).into_response(),
+        };
+    }
+
     let resp = crate::query::execute(&state.store, &parsed, rfc3339_z);
     let bytes = serde_json::to_vec(&resp).expect("query response serializes");
     Response::builder()
@@ -646,6 +664,84 @@ mod tests {
         let req = Request::get("/notes/Proj/").body(Body::empty()).unwrap();
         let resp = send(r, req).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Note builder with caller-chosen frontmatter and body, for the
+    /// [ANW-26] merge-mode tests.
+    fn note_fm(path: &str, fm: BTreeMap<String, Value>, body: &str) -> Note {
+        let raw = format!("---\n# fm\n---\n{body}");
+        let etag = format!("\"{}\"", blake3::hash(raw.as_bytes()).to_hex());
+        let size = raw.len() as u64;
+        Note {
+            path: path.into(),
+            frontmatter: fm,
+            body: body.into(),
+            raw_bytes: raw.into_bytes(),
+            last_modified: DateTime::from_timestamp(0, 0).unwrap(),
+            etag,
+            size,
+        }
+    }
+
+    fn kind_fm(kind: &str) -> BTreeMap<String, Value> {
+        let mut fm = BTreeMap::new();
+        fm.insert("kind".into(), Value::String(kind.into()));
+        fm
+    }
+
+    #[tokio::test]
+    async fn query_accept_markdown_merges_bodies() {
+        let (r, _) = router_with(vec![note("a.md", "Body A."), note("b.md", "Body B.")]);
+        let req = Request::get("/query")
+            .header(ACCEPT, "text/markdown")
+            .body(Body::empty())
+            .unwrap();
+        let resp = send(r, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap(),
+            "text/markdown; charset=utf-8"
+        );
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(
+            text,
+            "<!-- source: a.md -->\nBody A.\n\n<!-- source: b.md -->\nBody B."
+        );
+    }
+
+    #[tokio::test]
+    async fn query_without_accept_is_json_no_body() {
+        let (r, _) = router_with(vec![note("a.md", "Body A.")]);
+        let req = Request::get("/query").body(Body::empty()).unwrap();
+        let resp = send(r, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["total"], 1);
+        assert!(v["results"][0].get("body").is_none());
+    }
+
+    #[tokio::test]
+    async fn query_markdown_kind_guard_returns_400() {
+        let (r, _) = router_with(vec![
+            note_fm("a.md", kind_fm("PDR"), "a"),
+            note_fm("b.md", kind_fm("ADR"), "b"),
+        ]);
+        let req = Request::get("/query?__anw-kind=kind")
+            .header(ACCEPT, "text/markdown")
+            .body(Body::empty())
+            .unwrap();
+        let resp = send(r, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("PDR"));
+        assert!(text.contains("ADR"));
     }
 
     #[test]

@@ -16,6 +16,8 @@
 //! [[ADR-009 Reverse ADR-002 In-Memory Evaluation No Tantivy]] for the
 //! call to keep evaluation in-memory rather than carrying a Tantivy index.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, NaiveDate};
 use regex::Regex;
 use serde::Serialize;
@@ -81,6 +83,21 @@ pub struct ParsedQuery {
     pub recursive: bool,
     pub path_prefix: Option<String>,
     pub limit: Option<usize>,
+    /// `__anw-order` -- fragment ordering for markdown-merge mode ([ANW-26]).
+    /// `None` orders by path. Meaningful only in merge mode; the JSON path
+    /// ignores it.
+    pub order: Option<OrderSpec>,
+    /// `__anw-kind` -- homogeneity-guard key for markdown-merge mode
+    /// ([ANW-26]). Meaningful only in merge mode.
+    pub kind_key: Option<String>,
+}
+
+/// Parsed `__anw-order=<frontmatter-key>[:asc|:desc]`. `desc` is `false`
+/// (ascending) unless the value carries an explicit `:desc` suffix.
+#[derive(Debug, Clone)]
+pub struct OrderSpec {
+    pub key: String,
+    pub desc: bool,
 }
 
 impl ParsedQuery {
@@ -90,6 +107,8 @@ impl ParsedQuery {
             recursive: true,
             path_prefix: None,
             limit: None,
+            order: None,
+            kind_key: None,
         }
     }
 }
@@ -190,9 +209,38 @@ fn apply_control(q: &mut ParsedQuery, name: &str, value: &str) -> Result<(), Que
                 .map_err(|_| QueryError::BadControl(format!("limit={value}")))?;
             q.limit = Some(n);
         }
+        "order" => {
+            q.order = Some(parse_order(value)?);
+        }
+        "kind" => {
+            if value.is_empty() {
+                return Err(QueryError::BadControl("kind: empty key".to_string()));
+            }
+            q.kind_key = Some(value.to_string());
+        }
         unknown => return Err(QueryError::BadControl(unknown.to_string())),
     }
     Ok(())
+}
+
+/// Split `__anw-order` into its key and direction. Only the literal `:asc`
+/// and `:desc` suffixes are recognized; any other value is taken whole as the
+/// key. An empty key is `400`.
+fn parse_order(value: &str) -> Result<OrderSpec, QueryError> {
+    let (key, desc) = if let Some(k) = value.strip_suffix(":desc") {
+        (k, true)
+    } else if let Some(k) = value.strip_suffix(":asc") {
+        (k, false)
+    } else {
+        (value, false)
+    };
+    if key.is_empty() {
+        return Err(QueryError::BadControl(format!("order={value}")));
+    }
+    Ok(OrderSpec {
+        key: key.to_string(),
+        desc,
+    })
 }
 
 fn percent_decode(input: &str) -> Option<String> {
@@ -288,6 +336,197 @@ where
         results,
         total,
         truncated,
+    }
+}
+
+/// A single matched note projected for markdown-merge mode ([ANW-26]).
+/// Unlike the JSON path, this deliberately clones the note `body` -- merge
+/// mode materializes bodies. The order/kind keys are pulled out under the
+/// read lock so the lock is not held during sort/assembly.
+struct Fragment {
+    path: String,
+    body: String,
+    order_value: Option<Value>,
+    kind_value: Option<Value>,
+}
+
+/// Failure modes of [`execute_merge`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum MergeError {
+    /// The `__anw-kind` homogeneity guard rejected the matched set. The
+    /// `String` is the ready-to-send `400` body naming the offenders.
+    KindGuard(String),
+}
+
+/// Run a parsed query in markdown-merge mode: concatenate the bodies of all
+/// matched notes into one document, each fragment preceded by an HTML-comment
+/// source marker. See [ANW-26].
+///
+/// `__anw-kind` and `__anw-order` both apply to the full matched set, before
+/// `__anw-limit` truncates: the guard's pass/fail is independent of the cap,
+/// and the cap keeps the top-N by the order key.
+///
+/// Returns the assembled document, or [`MergeError::KindGuard`] when the
+/// homogeneity guard fails. An empty match set yields an empty document.
+///
+/// # Errors
+/// [`MergeError::KindGuard`] when `__anw-kind` is set and the matched notes
+/// do not all carry one and the same value for that key.
+pub fn execute_merge(store: &NoteStore, query: &ParsedQuery) -> Result<String, MergeError> {
+    let prefix = query.path_prefix.as_deref().unwrap_or("");
+    let mut frags = store.with_read(|notes| {
+        let mut out: Vec<Fragment> = Vec::new();
+        for (path, note) in notes {
+            if !path_matches(path, prefix, query.recursive) {
+                continue;
+            }
+            if !predicates_match(&query.predicates, &note.frontmatter) {
+                continue;
+            }
+            let order_value = query
+                .order
+                .as_ref()
+                .and_then(|o| lookup_dotted(&note.frontmatter, &o.key).cloned());
+            let kind_value = query
+                .kind_key
+                .as_ref()
+                .and_then(|k| lookup_dotted(&note.frontmatter, k).cloned());
+            out.push(Fragment {
+                path: note.path.clone(),
+                body: note.body.clone(),
+                order_value,
+                kind_value,
+            });
+        }
+        out
+    });
+
+    // Homogeneity guard over the full matched set, before __anw-limit.
+    if let Some(kind_key) = &query.kind_key {
+        let mut missing: Vec<&str> = Vec::new();
+        let mut by_value: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for f in &frags {
+            match &f.kind_value {
+                None => missing.push(&f.path),
+                Some(v) => by_value
+                    .entry(canonical_string(v))
+                    .or_default()
+                    .push(&f.path),
+            }
+        }
+        if !missing.is_empty() || by_value.len() > 1 {
+            return Err(MergeError::KindGuard(format_kind_error(
+                kind_key, &missing, &by_value,
+            )));
+        }
+    }
+
+    // Order before __anw-limit so the cap keeps the top-N by the order key,
+    // not a path-ordered prefix. Tie-break by path (ascending) for byte
+    // stability regardless of direction.
+    match &query.order {
+        Some(spec) => frags.sort_by(|a, b| {
+            order_cmp(a.order_value.as_ref(), b.order_value.as_ref(), spec.desc)
+                .then_with(|| a.path.cmp(&b.path))
+        }),
+        None => frags.sort_by(|a, b| a.path.cmp(&b.path)),
+    }
+
+    if let Some(limit) = query.limit {
+        frags.truncate(limit);
+    }
+
+    Ok(assemble(&frags))
+}
+
+/// Concatenate fragments into one markdown document. Each fragment is its
+/// source marker line followed by the verbatim, frontmatter-stripped body;
+/// fragments are joined with a blank line so the result stays valid markdown.
+fn assemble(frags: &[Fragment]) -> String {
+    frags
+        .iter()
+        .map(|f| format!("<!-- source: {} -->\n{}", f.path, f.body))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Build the `400` body for a failed `__anw-kind` guard. Distinct values are
+/// listed in sorted order, each with its paths; notes missing the key are
+/// named separately. Deterministic for byte-stable error responses.
+fn format_kind_error(
+    key: &str,
+    missing: &[&str],
+    by_value: &BTreeMap<String, Vec<&str>>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut s = format!(
+        "__anw-kind={key}: merge requires every matched note to share one value for `{key}`\n"
+    );
+    if by_value.len() > 1 {
+        s.push_str("distinct values found:\n");
+        for (val, paths) in by_value {
+            let _ = writeln!(s, "  {val}: {}", paths.join(", "));
+        }
+    }
+    if !missing.is_empty() {
+        let _ = writeln!(s, "notes missing the key: {}", missing.join(", "));
+    }
+    s
+}
+
+/// Order two optional frontmatter values for `__anw-order`. Present values
+/// sort before missing ones regardless of direction; `desc` reverses only the
+/// comparison among present values.
+fn order_cmp(a: Option<&Value>, b: Option<&Value>, desc: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            let base = compare_values(x, y);
+            if desc { base.reverse() } else { base }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Compare two frontmatter values using the same coercion ladder as the
+/// range operators (date -> datetime -> int -> float -> string); see
+/// [`ordered_compare`]. Falls back to canonical-string comparison when no
+/// rung matches both sides.
+fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if let (Some(x), Some(y)) = (try_as_date(a), try_as_date(b)) {
+        return x.cmp(&y);
+    }
+    if let (Some(x), Some(y)) = (try_as_datetime(a), try_as_datetime(b)) {
+        return x.cmp(&y);
+    }
+    if let (Some(x), Some(y)) = (try_as_int(a), try_as_int(b)) {
+        return x.cmp(&y);
+    }
+    if let (Some(x), Some(y)) = (try_as_float(a), try_as_float(b)) {
+        return x.partial_cmp(&y).unwrap_or(Ordering::Equal);
+    }
+    canonical_string(a).cmp(&canonical_string(b))
+}
+
+/// Render a value to its canonical string -- the same dialect
+/// [`matches_scalar_eq`] compares against. Used as the grouping key for the
+/// kind guard and as the string-rung fallback for ordering.
+fn canonical_string(v: &Value) -> String {
+    use chrono::SecondsFormat;
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Date(d) => d.format("%Y-%m-%d").to_string(),
+        Value::DateTime(dt) => dt
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(SecondsFormat::Secs, true),
+        Value::Sequence(_) | Value::Mapping(_) => format!("{v:?}"),
     }
 }
 
@@ -761,5 +1000,164 @@ mod tests {
     fn unknown_control_param_returns_error() {
         let err = parse("__anw-flarble=1").unwrap_err();
         assert!(matches!(err, QueryError::BadControl(_)));
+    }
+
+    // --- [ANW-26] markdown-merge mode ---
+
+    fn note_body(path: &str, fm: Frontmatter, body: &str) -> Note {
+        Note {
+            path: path.into(),
+            frontmatter: fm,
+            body: body.into(),
+            raw_bytes: Vec::new(),
+            last_modified: Utc.with_ymd_and_hms(2026, 5, 14, 12, 0, 0).unwrap(),
+            etag: "\"x\"".into(),
+            size: 0,
+        }
+    }
+
+    fn merge(q: &ParsedQuery, s: &NoteStore) -> Result<String, MergeError> {
+        execute_merge(s, q)
+    }
+
+    #[test]
+    fn order_parses_direction_suffix() {
+        assert!(!parse("__anw-order=num").unwrap().order.unwrap().desc);
+        let asc = parse("__anw-order=num:asc").unwrap().order.unwrap();
+        assert_eq!(asc.key, "num");
+        assert!(!asc.desc);
+        let desc = parse("__anw-order=num:desc").unwrap().order.unwrap();
+        assert_eq!(desc.key, "num");
+        assert!(desc.desc);
+    }
+
+    #[test]
+    fn order_empty_key_is_bad_control() {
+        assert!(matches!(
+            parse("__anw-order=:desc").unwrap_err(),
+            QueryError::BadControl(_)
+        ));
+        assert!(matches!(
+            parse("__anw-kind=").unwrap_err(),
+            QueryError::BadControl(_)
+        ));
+    }
+
+    #[test]
+    fn merge_concatenates_bodies_with_source_markers() {
+        let q = parse("").unwrap();
+        let s = store_with(vec![
+            note_body("a.md", fm(&[]), "Body A."),
+            note_body("b.md", fm(&[]), "Body B."),
+        ]);
+        let out = merge(&q, &s).unwrap();
+        assert_eq!(
+            out,
+            "<!-- source: a.md -->\nBody A.\n\n<!-- source: b.md -->\nBody B."
+        );
+    }
+
+    #[test]
+    fn merge_empty_match_set_is_empty_document() {
+        let q = parse("status=nope").unwrap();
+        let s = store_with(vec![note_body("a.md", fm(&[]), "Body A.")]);
+        assert_eq!(merge(&q, &s).unwrap(), "");
+    }
+
+    #[test]
+    fn merge_order_applies_before_limit() {
+        // Three notes ordered by `num` descending, capped to 2 -> keeps the
+        // top-2 by num (3, 2), not a path-ordered prefix.
+        let q = parse("__anw-order=num:desc&__anw-limit=2").unwrap();
+        let s = store_with(vec![
+            note_body("a.md", fm(&[("num", Value::Int(1))]), "one"),
+            note_body("b.md", fm(&[("num", Value::Int(3))]), "three"),
+            note_body("c.md", fm(&[("num", Value::Int(2))]), "two"),
+        ]);
+        let out = merge(&q, &s).unwrap();
+        assert_eq!(
+            out,
+            "<!-- source: b.md -->\nthree\n\n<!-- source: c.md -->\ntwo"
+        );
+    }
+
+    #[test]
+    fn merge_order_missing_key_sorts_last_then_by_path() {
+        let q = parse("__anw-order=num").unwrap();
+        let s = store_with(vec![
+            note_body("z.md", fm(&[("num", Value::Int(5))]), "five"),
+            note_body("m.md", fm(&[]), "no-num-m"),
+            note_body("a.md", fm(&[]), "no-num-a"),
+        ]);
+        let out = merge(&q, &s).unwrap();
+        // num=5 first; the two key-less notes follow, tie-broken by path.
+        assert_eq!(
+            out,
+            "<!-- source: z.md -->\nfive\n\n<!-- source: a.md -->\nno-num-a\n\n<!-- source: m.md -->\nno-num-m"
+        );
+    }
+
+    #[test]
+    fn merge_kind_guard_passes_when_uniform() {
+        let q = parse("__anw-kind=kind").unwrap();
+        let s = store_with(vec![
+            note_body("a.md", fm(&[("kind", Value::String("PDR".into()))]), "a"),
+            note_body("b.md", fm(&[("kind", Value::String("PDR".into()))]), "b"),
+        ]);
+        assert!(merge(&q, &s).is_ok());
+    }
+
+    #[test]
+    fn merge_kind_guard_rejects_distinct_values() {
+        let q = parse("__anw-kind=kind").unwrap();
+        let s = store_with(vec![
+            note_body("a.md", fm(&[("kind", Value::String("PDR".into()))]), "a"),
+            note_body("b.md", fm(&[("kind", Value::String("ADR".into()))]), "b"),
+        ]);
+        let err = merge(&q, &s).unwrap_err();
+        let MergeError::KindGuard(msg) = err;
+        assert!(msg.contains("ADR"));
+        assert!(msg.contains("PDR"));
+        assert!(msg.contains("a.md"));
+        assert!(msg.contains("b.md"));
+    }
+
+    #[test]
+    fn merge_kind_guard_rejects_missing_key() {
+        let q = parse("__anw-kind=kind").unwrap();
+        let s = store_with(vec![
+            note_body("a.md", fm(&[("kind", Value::String("PDR".into()))]), "a"),
+            note_body("b.md", fm(&[]), "b"),
+        ]);
+        let err = merge(&q, &s).unwrap_err();
+        let MergeError::KindGuard(msg) = err;
+        assert!(msg.contains("missing the key"));
+        assert!(msg.contains("b.md"));
+    }
+
+    #[test]
+    fn merge_kind_guard_evaluated_over_full_set_before_limit() {
+        // The limit would keep only the first note (uniform), but the guard
+        // must still see the mismatched second note and reject.
+        let q = parse("__anw-kind=kind&__anw-limit=1&__anw-order=num").unwrap();
+        let s = store_with(vec![
+            note_body(
+                "a.md",
+                fm(&[
+                    ("kind", Value::String("PDR".into())),
+                    ("num", Value::Int(1)),
+                ]),
+                "a",
+            ),
+            note_body(
+                "b.md",
+                fm(&[
+                    ("kind", Value::String("ADR".into())),
+                    ("num", Value::Int(2)),
+                ]),
+                "b",
+            ),
+        ]);
+        assert!(merge(&q, &s).is_err());
     }
 }
