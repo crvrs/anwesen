@@ -1,0 +1,86 @@
+# Release builds for anwesen ([ANW-29]).
+#
+# GitHub is a secondary remote that aav pushes to by hand; the primary home
+# is the operator's forge. aav creates and publishes a GitHub Release in the
+# UI (the release carries its own tag). This workflow reacts to that publish:
+# for each target it runs the tests, builds the release binary, and uploads
+# it as a target-named asset on the triggering release. It never creates the
+# tag or the release.
+name: release
+
+on:
+  release:
+    types: [published]
+
+# The build jobs attach binaries to the triggering release.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One target's failure should not cancel the other's build.
+      fail-fast: false
+      matrix:
+        include:
+          # amd64 Linux -- the deploy target. Built natively on ubuntu-latest.
+          - runner: ubuntu-latest
+            label: x86_64-linux
+            os: linux
+          # arm macOS -- aav's local machine. Built natively on Apple Silicon.
+          - runner: macos-14
+            label: aarch64-macos
+            os: macos
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      # Stable channel; edition 2024 needs >= 1.85, and Cargo.toml pins the
+      # MSRV at 1.95. Pin an explicit version here if a frozen release
+      # toolchain is ever required.
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry, index, and target
+        uses: Swatinem/rust-cache@v2
+
+      # The HTTP contract harness (tests/run-hurl.sh, per ADR-008) boots
+      # `anwesen serve` and runs hurl against it -- headless, so it runs in CI.
+      # The HTTP contract is arch-independent, so it runs once on Linux; the
+      # macOS runner's stock bash is 3.2 and the harness needs bash 4+
+      # (`shopt -s globstar`), which would only add fragility for no extra
+      # coverage.
+      - name: Install hurl
+        if: matrix.os == 'linux'
+        run: |
+          curl -fsSL -o /tmp/hurl.deb \
+            https://github.com/Orange-OpenSource/hurl/releases/download/8.0.0/hurl_8.0.0_amd64.deb
+          sudo dpkg -i /tmp/hurl.deb
+
+      # Test before building the artifact so a release never ships a red build.
+      # The debug build here is what run-hurl.sh exercises.
+      - name: Run the Rust test suite
+        run: cargo test --locked
+
+      - name: Run the HTTP contract tests
+        if: matrix.os == 'linux'
+        run: tests/run-hurl.sh
+
+      - name: Build the release binary
+        run: cargo build --release --locked
+
+      # The runner is native to its target, so target/release/anwesen is the
+      # target binary. Name it so the target is unambiguous on the release.
+      - name: Name the asset for its target
+        run: |
+          install -m 0755 target/release/anwesen \
+            "anwesen-${{ github.event.release.tag_name }}-${{ matrix.label }}"
+
+      - name: Upload the binary to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: anwesen-${{ github.event.release.tag_name }}-${{ matrix.label }}
