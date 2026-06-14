@@ -1,6 +1,6 @@
 # Anwesen
 
-> *Anwesen* (German): the premises, the estate -- and, in Heidegger, a coming-to-presence. A read-only HTTP daemon that brings a markdown vault into presence over the network.
+> _Anwesen_ (German): the premises, the estate -- and, in Heidegger, a coming-to-presence. A read-only HTTP daemon that brings a markdown vault into presence over the network.
 
 Anwesen serves an Obsidian-style markdown vault read-only over HTTP. It walks the notes in place, parses their YAML frontmatter, and lets remote clients query notes by frontmatter fields, read individual notes, and list folders -- with no database, no copy, and no migration of the underlying directory. The same query and merge engine is also available offline as a one-shot CLI.
 
@@ -16,9 +16,9 @@ Obsidian vault  ->  Anwesen (walk + frontmatter index)  ->  HTTP/JSON  ->  consu
 
 Anwesen answers three kinds of question over HTTP:
 
-- *Give me this one note* -- `GET /notes/<path>`
-- *List the contents of this folder* -- `GET /notes/<folder>/`
-- *Find every note whose frontmatter matches these predicates* -- `GET /query?...`
+- _Give me this one note_ -- `GET /notes/<path>`
+- _List the contents of this folder_ -- `GET /notes/<folder>/`
+- _Find every note whose frontmatter matches these predicates_ -- `GET /query?...`
 
 The frontmatter index is built once at startup and kept current by watching the vault directory. The index lives in memory; a restart rebuilds it, and there is nothing on disk to corrupt or migrate.
 
@@ -61,12 +61,12 @@ anwesen merge  --vault <path> --query <query-string>
 anwesen version
 ```
 
-| Flag | Env var | Default | Meaning |
-|---|---|---|---|
-| `--vault <path>` | `ANWESEN_VAULT` | *required* | Path to the vault root. |
-| `--bind <addr:port>` | `ANWESEN_BIND` | `127.0.0.1:8080` | Listen address for `serve`. |
-| `--log-level <level>` | `ANWESEN_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, or `trace`. |
-| `--query <query-string>` | -- | *required for `merge`* | A `/query` query string: frontmatter predicates plus `__anw-` controls. |
+| Flag                     | Env var             | Default                | Meaning                                                                 |
+| ------------------------ | ------------------- | ---------------------- | ----------------------------------------------------------------------- |
+| `--vault <path>`         | `ANWESEN_VAULT`     | _required_             | Path to the vault root.                                                 |
+| `--bind <addr:port>`     | `ANWESEN_BIND`      | `127.0.0.1:8080`       | Listen address for `serve`.                                             |
+| `--log-level <level>`    | `ANWESEN_LOG_LEVEL` | `info`                 | `error`, `warn`, `info`, `debug`, or `trace`.                           |
+| `--query <query-string>` | --                  | _required for `merge`_ | A `/query` query string: frontmatter predicates plus `__anw-` controls. |
 
 Every flag has a matching `ANWESEN_<UPPER>` environment variable; CLI flags win over env vars.
 
@@ -101,28 +101,28 @@ GET /query?tags=anwesen&kind=adr
 
 **Field operators** (suffix on the key):
 
-| Suffix | Example | Meaning |
-|---|---|---|
-| *(none)* | `tags=python` | Exact match on scalars; "contains" if the field is a list. |
-| `__in` | `tags__in=python,go` | Any of the listed values matches. |
-| `__all` | `tags__all=python,fastapi` | List contains all listed values. |
-| `__not` | `status__not=draft` | Negation. |
-| `__exists` | `deprecated__exists=false` | Presence / absence of the key. |
-| `__regex` | `title__regex=^PDR-\d+` | Regex on a scalar (anchor it for speed). |
-| `__prefix` | `path__prefix=Projects` | String prefix. |
-| `__gt` `__gte` `__lt` `__lte` | `date__gte=2026-01-01` | Ordered comparison; numbers and ISO dates. |
+| Suffix                        | Example                    | Meaning                                                    |
+| ----------------------------- | -------------------------- | ---------------------------------------------------------- |
+| _(none)_                      | `tags=python`              | Exact match on scalars; "contains" if the field is a list. |
+| `__in`                        | `tags__in=python,go`       | Any of the listed values matches.                          |
+| `__all`                       | `tags__all=python,fastapi` | List contains all listed values.                           |
+| `__not`                       | `status__not=draft`        | Negation.                                                  |
+| `__exists`                    | `deprecated__exists=false` | Presence / absence of the key.                             |
+| `__regex`                     | `title__regex=^PDR-\d+`    | Regex on a scalar (anchor it for speed).                   |
+| `__prefix`                    | `path__prefix=Projects`    | String prefix.                                             |
+| `__gt` `__gte` `__lt` `__lte` | `date__gte=2026-01-01`     | Ordered comparison; numbers and ISO dates.                 |
 
 ISO-8601 dates and RFC 3339 datetimes are coerced to typed dates at read time, so range operators work on them. Nested keys use dots: `author.name=...`. Unknown operators return `400` rather than being silently ignored. Unanchored substring (`__contains`) is intentionally not provided; use `__regex`.
 
 **Control parameters** (`__anw-` prefix; configure the query rather than constrain matches):
 
-| Parameter | Default | Meaning |
-|---|---|---|
-| `__anw-recursive=<bool>` | `true` | Recurse into subdirectories. |
-| `__anw-path=<prefix>` | vault root | Restrict matches to a path prefix. |
-| `__anw-limit=<n>` | no limit | Cap the result list; `total` still reports the full match count. |
-| `__anw-order=<key>[:asc\|:desc]` | path order | Order fragments (merge mode only). |
-| `__anw-kind=<key>` | off | Refuse a mixed merge unless every matched note shares one value for the key (merge mode only). |
+| Parameter                        | Default    | Meaning                                                                                        |
+| -------------------------------- | ---------- | ---------------------------------------------------------------------------------------------- |
+| `__anw-recursive=<bool>`         | `true`     | Recurse into subdirectories.                                                                   |
+| `__anw-path=<prefix>`            | vault root | Restrict matches to a path prefix.                                                             |
+| `__anw-limit=<n>`                | no limit   | Cap the result list; `total` still reports the full match count.                               |
+| `__anw-order=<key>[:asc\|:desc]` | path order | Order fragments (merge mode only).                                                             |
+| `__anw-kind=<key>`               | off        | Refuse a mixed merge unless every matched note shares one value for the key (merge mode only). |
 
 By default `/query` returns metadata only; fetch bodies with `/notes/<path>`.
 
@@ -165,13 +165,17 @@ This is the materialization path: build a `CLAUDE.md`, a skill bundle, or any si
 ## Design notes
 
 - **In place, read-only.** Anwesen reads the same directory Obsidian writes to and never writes back. The vault stays editable in Obsidian with no coordination, and there is no write API by design.
-- **Frontmatter is the index.** Filtering is server-side and first-class; clients never walk-and-parse. Note *bodies* are served verbatim but not full-text indexed.
+- **Frontmatter is the index.** Filtering is server-side and first-class; clients never walk-and-parse. Note _bodies_ are served verbatim but not full-text indexed.
 - **No authentication.** Anwesen trusts every request it accepts and binds `127.0.0.1` by default. Put a reverse proxy (nginx, caddy, warpgate) in front for TLS and access control. The contract is simple: if you can reach Anwesen, you can read everything it indexes.
 - **Standalone.** Anwesen is its own repository with its own release cycle, reusable by any consumer -- not a sub-package of the first thing that used it.
 
 ## Implementation
 
 Rust (2024 edition) on Tokio: `axum`/`tower` for HTTP, `clap` for the CLI, `tracing` for logs, `serde` (with `serde_yaml` and `serde_json`) for the data model, `notify` for filesystem watching, and BLAKE3 for ETags. The frontmatter index is evaluated in memory; there is no external search engine and no on-disk index.
+
+## A Note on Agentic Engineering
+
+LLM agents were heavily involved in writing this code. Every change has nonetheless been reviewed by a human, who made a best effort to understand, test, and validate it before it landed. Where the agents and the human disagreed, the human had the final say -- and bears responsibility for the result, bugs included. Read it with the same scrutiny you'd apply to any code: trust, but verify.
 
 ## License
 
