@@ -4,7 +4,7 @@ description = "Read-only HTTP daemon over a markdown vault, querying YAML frontm
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.95"
-license = "MIT OR Apache-2.0"
+license = "BSD-3-Clause"
 repository = "ssh://gw.aristov.cc/srv/repos/anwesen.git"
 
 [[bin]]
