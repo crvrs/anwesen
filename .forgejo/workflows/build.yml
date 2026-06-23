@@ -16,6 +16,16 @@
 # stable release. forgejo-release creates the release (from the checked-out
 # sha) if it does not exist, and `override: true` lets a re-run replace the
 # assets.
+#
+# Runner topology. There is one self-hosted runner registered `linux-amd64`
+# with `:host` execution -- jobs run directly on the host, not in a container.
+# The host provides node, git, rustup/cargo, hurl, and the aarch64 cross
+# linker, so the workflow uses them in place rather than installing anything
+# (the host user has no passwordless sudo). One linear job on this one amd64
+# host: test once, then build x86_64 natively and aarch64 by cross-compilation,
+# then publish both. A single job (not a matrix) matches the single-runner,
+# capacity-1 reality and means one publish step -- no get-or-create race on the
+# release between parallel legs.
 name: build
 
 on:
@@ -25,91 +35,82 @@ on:
         description: Release tag the binaries attach to (created if absent).
         required: true
         default: nightly
+      # String, not boolean: a `type: boolean` input does not survive an API
+      # workflow_dispatch into `${{ inputs.prerelease }}` (the string `tag`
+      # input does -- that asymmetry is why test runs published as Stable).
+      # forgejo-release also runs the value as a shell command (`if $PRERELEASE`),
+      # so it must be the literal `true`/`false`.
       prerelease:
-        description: Mark the release as a prerelease.
-        type: boolean
-        default: true
+        description: Mark the release as a prerelease ('true' or 'false').
+        type: string
+        default: 'true'
 
 # forgejo-release uploads assets to a release in this repository.
 permissions:
   contents: write
 
 jobs:
-  build:
-    name: ${{ matrix.label }}
-    # NOTE: these labels must match the labels your act_runner registered
-    # with -- adjust to your forge's runner topology. `linux-amd64` assumes a
-    # Linux host with a C toolchain (cc/ld) for the native build; `macos-arm64`
-    # assumes a native Apple Silicon macOS runner. There is no GitHub-hosted
-    # macOS on a self-hosted forge, so the arm64 build needs a registered Mac.
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      # One target's failure should not cancel the other's build.
-      fail-fast: false
-      matrix:
-        include:
-          # amd64 Linux -- the deploy target. Built natively.
-          - runner: linux-amd64
-            label: x86_64-linux
-            os: linux
-          # arm macOS (apple silicon) -- aav's local machine. Built natively.
-          - runner: macos-arm64
-            label: aarch64-macos
-            os: macos
+  release:
+    name: build and publish
+    runs-on: linux-amd64
+    env:
+      # cargo picks the linker for the aarch64 target from this; the host
+      # already provides aarch64-linux-gnu-gcc.
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
     steps:
       - name: Check out the workflow ref
         uses: actions/checkout@v4
 
-      # Stable channel; edition 2024 needs >= 1.85, and Cargo.toml pins the
-      # MSRV at 1.95. Pin an explicit version here if a frozen release
-      # toolchain is ever required.
-      - name: Install the Rust toolchain
-        uses: https://github.com/dtolnay/rust-toolchain@stable
+      # The :host runner runs steps in a minimal /bin/sh without the host's
+      # cargo on PATH, and this act version propagates neither GITHUB_PATH nor
+      # an in-step `export` to the command that needs it -- and $HOME is not
+      # reliably set inside a run step. So each toolchain command carries an
+      # absolute cargo path as a one-shot PATH prefix: no persistence, no $HOME.
+      # The path is the ws-brn host's cargo home; if the runner host changes,
+      # update it (or set the toolchain on PATH in the runner's own env).
 
-      - name: Cache cargo registry, index, and target
-        uses: https://github.com/Swatinem/rust-cache@v2
+      # Test before building so a release never ships a red build. The debug
+      # build here is what run-hurl.sh exercises.
+      - name: Run the Rust test suite
+        run: PATH="/home/agents/brn/.cargo/bin:$PATH" cargo test --locked
 
       # The HTTP contract harness (tests/run-hurl.sh, per ADR-008) boots
       # `anwesen serve` and runs hurl against it -- headless, so it runs in CI.
-      # The HTTP contract is arch-independent, so it runs once on Linux; the
-      # macOS runner's stock bash is 3.2 and the harness needs bash 4+
-      # (`shopt -s globstar`), which would only add fragility for no extra
-      # coverage.
-      - name: Install hurl
-        if: matrix.os == 'linux'
-        run: |
-          curl -fsSL -o /tmp/hurl.deb \
-            https://github.com/Orange-OpenSource/hurl/releases/download/8.0.0/hurl_8.0.0_amd64.deb
-          sudo dpkg -i /tmp/hurl.deb
-
-      # Test before building the artifact so a release never ships a red build.
-      # The debug build here is what run-hurl.sh exercises.
-      - name: Run the Rust test suite
-        run: cargo test --locked
-
       - name: Run the HTTP contract tests
-        if: matrix.os == 'linux'
-        run: tests/run-hurl.sh
+        run: PATH="/home/agents/brn/.cargo/bin:$PATH" tests/run-hurl.sh
 
-      - name: Build the release binary
-        run: cargo build --release --locked
+      # x86_64 is native; aarch64 std is needed for the cross build. Both are
+      # idempotent if already present.
+      - name: Add the Rust targets
+        run: |
+          PATH="/home/agents/brn/.cargo/bin:$PATH" rustup target add x86_64-unknown-linux-gnu
+          PATH="/home/agents/brn/.cargo/bin:$PATH" rustup target add aarch64-unknown-linux-gnu
 
-      # The runner is native to its target, so target/release/anwesen is the
-      # target binary. forgejo-release uploads everything under the release
-      # dir, so the staged name is the asset name -- make the target explicit.
-      - name: Stage the asset for its target
+      - name: Build the release binaries
+        run: |
+          PATH="/home/agents/brn/.cargo/bin:$PATH" cargo build --release --locked --target x86_64-unknown-linux-gnu
+          PATH="/home/agents/brn/.cargo/bin:$PATH" cargo build --release --locked --target aarch64-unknown-linux-gnu
+
+      # forgejo-release uploads everything under the release dir, so the staged
+      # name is the asset name -- make each target explicit. The tag goes
+      # through env, not direct interpolation into the run body.
+      - name: Stage the assets
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
           mkdir -p dist/release
-          install -m 0755 target/release/anwesen \
-            "dist/release/anwesen-${{ inputs.tag }}-${{ matrix.label }}"
+          install -m 0755 target/x86_64-unknown-linux-gnu/release/anwesen \
+            "dist/release/anwesen-${TAG}-x86_64-linux"
+          install -m 0755 target/aarch64-unknown-linux-gnu/release/anwesen \
+            "dist/release/anwesen-${TAG}-aarch64-linux"
 
-      - name: Publish the binary to the Forgejo release
+      - name: Publish the binaries to the Forgejo release
         uses: https://code.forgejo.org/actions/forgejo-release@v2
         with:
           direction: upload
           url: ${{ env.GITHUB_SERVER_URL }}
           repo: ${{ github.repository }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_TOKEN }}
           tag: ${{ inputs.tag }}
           sha: ${{ github.sha }}
           release-dir: dist/release
