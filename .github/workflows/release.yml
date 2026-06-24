@@ -85,17 +85,20 @@ jobs:
         run: cargo build --release --locked
 
       # The runner is native to its target, so target/release/anwesen is the
-      # target binary. Name it so the target is unambiguous on the release.
-      - name: Name the asset for its target
+      # target binary (already stripped via the release profile). Name it so
+      # the target is unambiguous, then gzip it -- ap keeps every release and
+      # the raw binaries are the bulk of that, so assets ship compressed.
+      - name: Name and compress the asset for its target
         run: |
-          install -m 0755 target/release/anwesen \
-            "anwesen-${{ github.event.inputs.tag || github.ref_name }}-${{ matrix.label }}"
+          asset="anwesen-${{ github.event.inputs.tag || github.ref_name }}-${{ matrix.label }}"
+          install -m 0755 target/release/anwesen "$asset"
+          gzip -9 "$asset"
 
       - name: Stash the binary for the publish job
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.label }}
-          path: anwesen-*-${{ matrix.label }}
+          path: anwesen-*-${{ matrix.label }}.gz
           if-no-files-found: error
 
   publish:
