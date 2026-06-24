@@ -1,43 +1,55 @@
-# Release builds for anwesen ([ANW-29]).
+# Release builds for anwesen ([ANW-32], pattern from IT-86).
 #
-# GitHub is a secondary remote that aav pushes to by hand; the primary home
-# is the operator's forge. aav creates and publishes a GitHub Release in the
-# UI (the release carries its own tag). This workflow reacts to that publish:
-# for each target it runs the tests, builds the release binary, and uploads
-# it as a target-named asset on the triggering release. It never creates the
-# tag or the release.
+# Forgejo (carvers/anwesen on ap) is canonical for both code and releases.
+# GitHub is only the build farm -- it has the macOS runners. Publishing is a
+# single act on Forgejo: create a `v*` tag (or release) there, it mirrors to
+# the GitHub mirror, and that pushed tag triggers this workflow. For each
+# target the build job tests and builds the binary; a final publish job creates
+# the GitHub release with every binary, then mirrors them back onto the
+# matching Forgejo release. No manual "new release" step on GitHub.
 name: release
 
 on:
-  release:
-    types: [published]
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)build
+        required: true
 
-# The build jobs attach binaries to the triggering release.
+# The publish job attaches binaries to the GitHub release it creates.
 permissions:
   contents: write
+
+env:
+  # The Forgejo repo that receives the release assets (owner/name on ap).
+  FORGEJO_REPO: carvers/anwesen
+  FORGEJO_API: https://forge.crvrs.org/api/v1
 
 jobs:
   build:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
     strategy:
-      # One target's failure should not cancel the other's build.
+      # One target's failure should not cancel the others' builds.
       fail-fast: false
       matrix:
         include:
           # amd64 Linux -- the deploy target. Built natively on ubuntu-latest.
           - runner: ubuntu-latest
             label: x86_64-linux
-            os: linux
+          # arm64 Linux -- Graviton / Pi / ARM servers. Built natively.
+          - runner: ubuntu-24.04-arm
+            label: aarch64-linux
           # arm macOS -- aav's local machine. Built natively on Apple Silicon.
           - runner: macos-14
             label: aarch64-macos
-            os: macos
     steps:
       - name: Check out the release tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
 
       # Stable channel; edition 2024 needs >= 1.85, and Cargo.toml pins the
       # MSRV at 1.95. Pin an explicit version here if a frozen release
@@ -49,13 +61,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # The HTTP contract harness (tests/run-hurl.sh, per ADR-008) boots
-      # `anwesen serve` and runs hurl against it -- headless, so it runs in CI.
-      # The HTTP contract is arch-independent, so it runs once on Linux; the
-      # macOS runner's stock bash is 3.2 and the harness needs bash 4+
-      # (`shopt -s globstar`), which would only add fragility for no extra
-      # coverage.
+      # `anwesen serve` and runs hurl against it. The contract is
+      # arch-independent, so it runs once on the deploy target; the macOS
+      # runner's stock bash is 3.2 and the harness needs bash 4+
+      # (`shopt -s globstar`), which would only add fragility for no coverage.
       - name: Install hurl
-        if: matrix.os == 'linux'
+        if: matrix.label == 'x86_64-linux'
         run: |
           curl -fsSL -o /tmp/hurl.deb \
             https://github.com/Orange-OpenSource/hurl/releases/download/8.0.0/hurl_8.0.0_amd64.deb
@@ -67,7 +78,7 @@ jobs:
         run: cargo test --locked
 
       - name: Run the HTTP contract tests
-        if: matrix.os == 'linux'
+        if: matrix.label == 'x86_64-linux'
         run: tests/run-hurl.sh
 
       - name: Build the release binary
@@ -78,9 +89,62 @@ jobs:
       - name: Name the asset for its target
         run: |
           install -m 0755 target/release/anwesen \
-            "anwesen-${{ github.event.release.tag_name }}-${{ matrix.label }}"
+            "anwesen-${{ github.event.inputs.tag || github.ref_name }}-${{ matrix.label }}"
 
-      - name: Upload the binary to the release
+      - name: Stash the binary for the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: anwesen-*-${{ matrix.label }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect every target's binary
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the GitHub release with all binaries
         uses: softprops/action-gh-release@v2
         with:
-          files: anwesen-${{ github.event.release.tag_name }}-${{ matrix.label }}
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist/*
+
+      # Forgejo is canonical: push the same binaries onto the matching Forgejo
+      # release. Find the release by tag; create it if the tag has no release
+      # object yet; then upload each binary as an asset.
+      - name: Mirror binaries to the Forgejo release
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TOKEN: ${{ secrets.FORGEJO_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth="Authorization: token $TOKEN"
+          base="$FORGEJO_API/repos/$FORGEJO_REPO/releases"
+
+          # Look up the Forgejo release for this tag. Forgejo answers 404 when
+          # the tag has no release object yet, so branch on the status code:
+          # `curl -f` would exit 22 on that 404 and, under pipefail, abort the
+          # step before the create path could run.
+          body=$(mktemp)
+          code=$(curl -sS -o "$body" -w '%{http_code}' -H "$auth" "$base/tags/$TAG")
+          case "$code" in
+            200) id=$(jq -r '.id' "$body") ;;
+            404) id=$(curl -fsS -H "$auth" -H 'Content-Type: application/json' \
+                   -X POST "$base" \
+                   -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\"}" | jq -r '.id') ;;
+            *)   echo "Forgejo release lookup failed: HTTP $code" >&2
+                 cat "$body" >&2
+                 exit 1 ;;
+          esac
+
+          for f in dist/*; do
+            curl -fsS -H "$auth" \
+              -F "attachment=@$f;filename=$(basename "$f")" \
+              "$base/$id/assets?name=$(basename "$f")" >/dev/null
+            echo "uploaded $(basename "$f")"
+          done
