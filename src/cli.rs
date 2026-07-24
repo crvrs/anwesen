@@ -4,14 +4,18 @@
 //!
 //! ```text
 //! anwesen serve  --vault <path> [--bind <addr:port>] [--log-level <level>]
+//!                [--uptrace-dsn <dsn> | --otlp-endpoint <url>]
+//!                [--otlp-header <key=value>]... [--otlp-slow-request-ms <n>]
 //! anwesen doctor --vault <path> [--log-level <level>]
 //! anwesen merge  --vault <path> [--query <string>] [--log-level <level>]
 //! anwesen version
 //! ```
 //!
-//! `--bind` is `serve`-only; `doctor` and `merge` do not bind a port;
-//! `version` takes no flags. Each flag has a matching `ANWESEN_<UPPER>`
-//! environment variable and CLI wins over env per the manual.
+//! `--bind` and the OTLP telemetry flags are `serve`-only ([ANW-37]);
+//! `doctor` and `merge` do not bind a port; `version` takes no flags. Each
+//! flag has a matching `ANWESEN_<UPPER>` environment variable and CLI wins
+//! over env per the manual. With no `--otlp-endpoint`/`--uptrace-dsn`,
+//! telemetry is off and the server behaves exactly as without these flags.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -51,6 +55,34 @@ pub struct ServeArgs {
     /// Log verbosity.
     #[arg(long, env = "ANWESEN_LOG_LEVEL", default_value = "info")]
     pub log_level: LogLevel,
+
+    /// uptrace DSN shorthand (`https://<token>@api.uptrace.dev`), parsed
+    /// into the OTLP endpoint plus an `uptrace-dsn` header. Mutually
+    /// exclusive with --otlp-endpoint. When this and --otlp-endpoint are
+    /// both unset, telemetry is fully off (ANW-37).
+    #[arg(long, env = "ANWESEN_UPTRACE_DSN")]
+    pub uptrace_dsn: Option<String>,
+
+    /// Generic OTLP/HTTP endpoint base URL for telemetry export. The
+    /// per-signal path (`/v1/metrics`, `/v1/traces`) is appended by the
+    /// exporter. Mutually exclusive with --uptrace-dsn.
+    #[arg(long, env = "ANWESEN_OTLP_ENDPOINT")]
+    pub otlp_endpoint: Option<String>,
+
+    /// Extra OTLP export header as `key=value`, repeatable. On the env var
+    /// (`ANWESEN_OTLP_HEADERS`) pass a comma-separated `key=value` list.
+    #[arg(
+        long = "otlp-header",
+        env = "ANWESEN_OTLP_HEADERS",
+        value_delimiter = ','
+    )]
+    pub otlp_headers: Vec<String>,
+
+    /// Requests at or over this duration in milliseconds, or answering a
+    /// 5xx, are additionally recorded as OTLP server spans; every other
+    /// request stays metrics-only.
+    #[arg(long, env = "ANWESEN_OTLP_SLOW_REQUEST_MS", default_value = "500")]
+    pub otlp_slow_request_ms: u64,
 }
 
 #[derive(Debug, clap::Args)]

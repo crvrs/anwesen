@@ -17,8 +17,17 @@ axum = "0.8"
 blake3 = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "serde", "clock"] }
 clap = { version = "4", features = ["derive", "env"] }
+http-body = "1"
 hydra = "0.1"
 notify = "8"
+opentelemetry = "0.32"
+# `reqwest-rustls` is required alongside `reqwest-blocking-client`: the
+# default otlp features wire reqwest with no TLS backend at all, so HTTPS to
+# the collector would fail. rustls (aws-lc-rs + OS trust store) keeps the
+# release binary free of a system OpenSSL dependency.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
+opentelemetry-semantic-conventions = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["metrics", "trace"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

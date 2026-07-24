@@ -40,6 +40,7 @@ use tokio::task::JoinHandle;
 use crate::health::HealthState;
 use crate::http::{self as http_layer, HttpState};
 use crate::store::NoteStore;
+use crate::telemetry::Telemetry;
 use crate::vault::{self, Note};
 use crate::watcher::run_debouncer;
 
@@ -117,17 +118,21 @@ pub struct Anwesen {
     pub store: Arc<NoteStore>,
     /// Shared mutable health surface consumed by `/health` ([ANW-8]).
     pub health: Arc<HealthState>,
+    /// Request-level telemetry handle ([ANW-37]). `None` disables export and
+    /// the request middleware entirely.
+    pub telemetry: Option<Arc<Telemetry>>,
 }
 
 impl Anwesen {
     #[must_use]
-    pub fn new(vault: PathBuf, bind: SocketAddr) -> Self {
+    pub fn new(vault: PathBuf, bind: SocketAddr, telemetry: Option<Arc<Telemetry>>) -> Self {
         Self {
             vault,
             bind,
             counters: RestartCounters::new(),
             store: NoteStore::new(),
             health: HealthState::new(),
+            telemetry,
         }
     }
 }
@@ -177,6 +182,7 @@ impl Application for Anwesen {
                 store: self.store.clone(),
                 health: self.health.clone(),
                 vault: self.vault.clone(),
+                telemetry: self.telemetry.clone(),
             }
             .child_spec(),
         ];
@@ -535,6 +541,7 @@ pub struct HttpServer {
     store: Arc<NoteStore>,
     health: Arc<HealthState>,
     vault: PathBuf,
+    telemetry: Option<Arc<Telemetry>>,
 }
 
 impl HttpServer {
@@ -544,12 +551,14 @@ impl HttpServer {
         let store = self.store.clone();
         let health = self.health.clone();
         let vault = self.vault.clone();
+        let telemetry = self.telemetry.clone();
         ChildSpec::new(HTTP_SERVER_NAME).start(move || {
             let bind = bind;
             let counters = counters.clone();
             let store = store.clone();
             let health = health.clone();
             let vault = vault.clone();
+            let telemetry = telemetry.clone();
             async move {
                 // Bind eagerly so the supervisor sees `bind: <addr>: ...`
                 // as the start error rather than a successful spawn that
@@ -558,12 +567,15 @@ impl HttpServer {
                     .await
                     .map_err(|e| ExitReason::from(format!("http_server: bind {bind}: {e}")))?;
                 let restart = counters.http_server.record_init();
-                let router = http_layer::router(HttpState {
-                    store,
-                    health,
-                    restart_counters: counters,
-                    vault,
-                });
+                let router = http_layer::router(
+                    HttpState {
+                        store,
+                        health,
+                        restart_counters: counters,
+                        vault,
+                    },
+                    telemetry,
+                );
                 let pid = Process::spawn_link(async move {
                     Process::set_flags(ProcessFlags::TRAP_EXIT);
                     tracing::info!(restart, bind = %bind, "http_server: init");

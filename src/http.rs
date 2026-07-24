@@ -12,16 +12,18 @@
 //! `/health` ([ANW-8]) onto the same [`Router`].
 
 use std::sync::Arc;
+use std::time::{Instant, SystemTime};
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{OriginalUri, Path as AxumPath, Request, State};
-use axum::http::header::{ACCEPT, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+use axum::http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::middleware::{Next, from_fn};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use chrono::{DateTime, SecondsFormat, Utc};
+use http_body::Body as _;
 use hydra::Process;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -31,6 +33,7 @@ use std::path::PathBuf;
 use crate::app::RestartCounters;
 use crate::health::HealthState;
 use crate::store::NoteStore;
+use crate::telemetry::{self, Telemetry, TraceHeaders};
 use crate::vault::{Note, frontmatter_to_json};
 
 /// Canonical RFC 3339 form with a `Z` suffix -- the shape the User Manual
@@ -49,18 +52,72 @@ pub struct HttpState {
     pub vault: PathBuf,
 }
 
-pub fn router(state: HttpState) -> Router {
+pub fn router(state: HttpState, telemetry: Option<Arc<Telemetry>>) -> Router {
     // `/notes/{*path}` is greedy and includes any trailing slash; one
     // handler dispatches read-one vs folder-listing on that suffix. The
     // root listing (`/notes/`) needs its own route since the wildcard
     // requires at least one character.
-    Router::new()
+    let router = Router::new()
         .route("/notes/", get(list_root_folder))
         .route("/notes/{*path}", get(get_notes))
         .route("/query", get(get_query))
         .route("/health", get(get_health))
-        .layer(from_fn(process_wrap))
-        .with_state(state)
+        .layer(from_fn(process_wrap));
+    // Telemetry is the outermost layer so it observes the final response,
+    // including the `500` that `process_wrap` synthesizes on a handler
+    // panic. Installed only when export is configured; a config-less server
+    // never runs this layer and is byte-for-byte as before ([ANW-37]).
+    let router = match telemetry {
+        Some(tel) => router.layer(from_fn_with_state(tel, telemetry_wrap)),
+        None => router,
+    };
+    router.with_state(state)
+}
+
+/// Outermost middleware: time the request, classify its route, and hand the
+/// completed observation to [`Telemetry`]. Trace-context headers are captured
+/// up front (the handler consumes the request); the parent context is only
+/// extracted later if the request turns out slow enough to span.
+async fn telemetry_wrap(
+    State(tel): State<Arc<Telemetry>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let start_instant = Instant::now();
+    let start_wall = SystemTime::now();
+    let route = telemetry::classify_route(request.uri().path());
+    let method = request.method().clone();
+    let if_none_match_present = request.headers().contains_key(IF_NONE_MATCH);
+    let trace = TraceHeaders::from_headers(request.headers());
+
+    let response = next.run(request).await;
+
+    let status = response.status().as_u16();
+    // In-memory handler bodies carry an exact size hint; fall back to a
+    // Content-Length header, then to 0, so a streaming body never panics.
+    let body_bytes = response
+        .body()
+        .size_hint()
+        .exact()
+        .or_else(|| content_length(response.headers()))
+        .unwrap_or(0);
+    let duration = start_instant.elapsed();
+
+    tel.finish(
+        route,
+        method.as_str(),
+        status,
+        if_none_match_present,
+        body_bytes,
+        duration,
+        start_wall,
+        &trace,
+    );
+    response
+}
+
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers.get(CONTENT_LENGTH)?.to_str().ok()?.parse().ok()
 }
 
 /// Per [ANW-25](https://crvrs.youtrack.cloud/issue/ANW-25): run each request
@@ -460,12 +517,15 @@ mod tests {
     fn router_with(notes: Vec<Note>) -> (Router, Arc<NoteStore>) {
         let store = NoteStore::new();
         store.replace(notes);
-        let r = router(HttpState {
-            store: store.clone(),
-            health: crate::health::HealthState::new(),
-            restart_counters: crate::app::RestartCounters::new(),
-            vault: PathBuf::from("/test/vault"),
-        });
+        let r = router(
+            HttpState {
+                store: store.clone(),
+                health: crate::health::HealthState::new(),
+                restart_counters: crate::app::RestartCounters::new(),
+                vault: PathBuf::from("/test/vault"),
+            },
+            None,
+        );
         (r, store)
     }
 
@@ -756,5 +816,47 @@ mod tests {
         assert!(resolve_path("a/./b").is_err());
         assert!(resolve_path("").is_err());
         assert!(resolve_path("a/%ZZ.md").is_err());
+    }
+
+    /// With telemetry installed, a normal request is answered byte-for-byte
+    /// as without it. The exporter points at an unreachable local port, so
+    /// export fails instantly in the background and never touches the
+    /// response path.
+    #[tokio::test]
+    async fn telemetry_layer_does_not_alter_responses() {
+        use crate::telemetry::{self, RawTelemetryArgs, TelemetryConfig};
+
+        let cfg = TelemetryConfig::resolve(RawTelemetryArgs {
+            otlp_endpoint: Some("http://127.0.0.1:9".into()),
+            slow_request_ms: 500,
+            ..Default::default()
+        })
+        .unwrap()
+        .expect("telemetry on");
+        let tel = Arc::new(telemetry::init(cfg).expect("telemetry init"));
+
+        let n = note("a.md", "body");
+        let expected_etag = n.etag.clone();
+        let store = NoteStore::new();
+        store.replace(vec![n]);
+        let r = router(
+            HttpState {
+                store,
+                health: crate::health::HealthState::new(),
+                restart_counters: crate::app::RestartCounters::new(),
+                vault: PathBuf::from("/test/vault"),
+            },
+            Some(tel.clone()),
+        );
+        let req = Request::get("/notes/a.md").body(Body::empty()).unwrap();
+        let resp = send(r, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(ETAG).unwrap(), expected_etag.as_str());
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["path"], "a.md");
+        assert_eq!(v["body"], "body");
+
+        tel.shutdown();
     }
 }

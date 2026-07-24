@@ -13,5 +13,6 @@ pub mod http;
 pub mod merge;
 pub mod query;
 pub mod store;
+pub mod telemetry;
 pub mod vault;
 pub mod watcher;
