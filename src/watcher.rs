@@ -124,13 +124,22 @@ fn appear(vault_root: &Path, abs: &Path) -> Option<WatchAction> {
 
 /// A path that is gone: a note to drop, or a directory whose notes are all
 /// gone with it. The filesystem cannot be asked -- it no longer holds the
-/// entry -- so the decision rests on the path's own shape.
-fn vanish(vault_root: &Path, abs: &Path) -> Option<WatchAction> {
-    if is_markdown(abs) {
-        note_relative(vault_root, abs).map(WatchAction::Delete)
-    } else {
-        tree_relative(vault_root, abs).map(WatchAction::DeleteTree)
+/// entry -- so both are emitted and the index decides which one matches.
+///
+/// A `.md` suffix does not prove the path was a file: a directory may carry
+/// it too, and then the suffix test alone strands its notes in the index
+/// [ANW-40]. The two key sets are disjoint -- the note delete removes the key
+/// `dir`, the prefix delete removes keys under `dir/` -- so emitting both is
+/// always safe. It costs one range scan per deleted note.
+fn vanish(vault_root: &Path, abs: &Path) -> Vec<WatchAction> {
+    let mut actions = Vec::new();
+    if let Some(rel) = note_relative(vault_root, abs) {
+        actions.push(WatchAction::Delete(rel));
     }
+    if let Some(rel) = tree_relative(vault_root, abs) {
+        actions.push(WatchAction::DeleteTree(rel));
+    }
+    actions
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -454,7 +463,10 @@ mod tests {
         );
         assert_eq!(
             map_event(&e, &vault()),
-            vec![WatchAction::Delete("a.md".into())]
+            vec![
+                WatchAction::Delete("a.md".into()),
+                WatchAction::DeleteTree("a.md".into())
+            ]
         );
     }
 
@@ -480,6 +492,7 @@ mod tests {
             map_event(&e, &vault()),
             vec![
                 WatchAction::Delete("a.md".into()),
+                WatchAction::DeleteTree("a.md".into()),
                 WatchAction::Upsert("b.md".into())
             ]
         );
@@ -490,7 +503,25 @@ mod tests {
         let e = ev(EventKind::Remove(RemoveKind::File), &["/v/a.md"]);
         assert_eq!(
             map_event(&e, &vault()),
-            vec![WatchAction::Delete("a.md".into())]
+            vec![
+                WatchAction::Delete("a.md".into()),
+                WatchAction::DeleteTree("a.md".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn removed_md_directory_drops_the_notes_under_it() {
+        // A directory may be named `*.md` too. The vanished path cannot be
+        // probed, so the note delete and the prefix delete both go out and
+        // the index applies whichever matches [ANW-40].
+        let e = ev(EventKind::Remove(RemoveKind::Folder), &["/v/Archive.md"]);
+        assert_eq!(
+            map_event(&e, &vault()),
+            vec![
+                WatchAction::Delete("Archive.md".into()),
+                WatchAction::DeleteTree("Archive.md".into())
+            ]
         );
     }
 
@@ -588,7 +619,10 @@ mod tests {
         let absent = ev(kind, &[]).add_path(root.path().join("gone.md"));
         assert_eq!(
             map_event(&absent, root.path()),
-            vec![WatchAction::Delete("gone.md".into())]
+            vec![
+                WatchAction::Delete("gone.md".into()),
+                WatchAction::DeleteTree("gone.md".into())
+            ]
         );
     }
 

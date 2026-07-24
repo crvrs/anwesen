@@ -195,6 +195,29 @@ mod tests {
     }
 
     #[test]
+    fn note_delete_and_prefix_delete_of_one_path_are_disjoint() {
+        // A vanished `*.md` path sends both, since it may have been a
+        // directory [ANW-40]. The note delete takes the key `Archive.md`,
+        // the prefix delete takes the keys under `Archive.md/`; neither
+        // reaches anything else.
+        let s = NoteStore::new();
+        s.replace(vec![
+            note("Archive.md"),
+            note("Archive.md/inner.md"),
+            note("Keep.md"),
+        ]);
+        let dropped = s.apply_batch(
+            vec![],
+            &["Archive.md".to_string()],
+            &["Archive.md".to_string()],
+        );
+        assert_eq!(dropped, 1);
+        assert!(s.get("Archive.md").is_none());
+        assert!(s.get("Archive.md/inner.md").is_none());
+        assert!(s.get("Keep.md").is_some());
+    }
+
+    #[test]
     fn apply_batch_prefix_delete_precedes_upserts() {
         let s = NoteStore::new();
         s.replace(vec![note("Notes/gone.md")]);
