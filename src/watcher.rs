@@ -4,7 +4,7 @@
 //! [`notify::RecommendedWatcher`] over the vault root. Each native event is
 //! pushed into a Tokio channel; [`run_debouncer`] drains the channel,
 //! classifies events into [`WatchAction`]s, coalesces a 100 ms window's
-//! worth into one [`Batch`], and casts the batch to the `index_writer`
+//! worth into one [`WatchBatch`], and casts the batch to the `index_writer`
 //! named process for a single [`crate::store::NoteStore`] write.
 //!
 //! See [[ADR-003 Filesystem Change Tracking]] for the event model.
@@ -27,7 +27,7 @@ use crate::vault;
 
 /// One path-scoped action derived from a native filesystem event. Always
 /// carries a vault-relative, forward-slash-normalized path string -- the
-/// same form [`vault::Note.path`] uses.
+/// same form [`vault::Note::path`] uses.
 ///
 /// The `*Tree` variants carry a directory instead of a note. Native events
 /// name only the directory when one is created, removed, or renamed; the

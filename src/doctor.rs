@@ -46,7 +46,7 @@ pub struct DriftShape {
     /// `"bool"`, `"number"`, `"string"`, `"date"`, `"list"`, `"mapping"`.
     pub shape: &'static str,
     pub count: usize,
-    /// Up to [`DRIFT_SAMPLES_PER_SHAPE`] vault-relative paths exhibiting
+    /// Up to `DRIFT_SAMPLES_PER_SHAPE` vault-relative paths exhibiting
     /// this shape, in the order they were scanned.
     pub samples: Vec<String>,
 }
