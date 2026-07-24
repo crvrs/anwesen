@@ -154,12 +154,23 @@ pub enum ScanWarningKind {
 
 /// Walk the vault and return every readable Markdown note alongside any
 /// per-file issues. The walk never panics on a single broken file.
+#[must_use]
 pub fn scan(vault_root: &Path) -> ScanResult {
+    scan_from(vault_root, vault_root)
+}
+
+/// Walk `start` (a directory inside `vault_root`) and return every readable
+/// Markdown note under it. Note paths stay relative to `vault_root`, so a
+/// subtree result is directly comparable with a full [`scan`]. Used by the
+/// watcher when a directory appears or is renamed into the vault [ANW-36]:
+/// the native event names the directory, never its files.
+#[must_use]
+pub fn scan_from(vault_root: &Path, start: &Path) -> ScanResult {
     let mut notes = Vec::new();
     let mut issues = Vec::new();
     let mut warnings = Vec::new();
 
-    let walker = WalkDir::new(vault_root)
+    let walker = WalkDir::new(start)
         .follow_links(false)
         .into_iter()
         // The root entry itself may have a dot-prefixed name (e.g., a

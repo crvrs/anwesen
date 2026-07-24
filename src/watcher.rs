@@ -28,10 +28,16 @@ use crate::vault;
 /// One path-scoped action derived from a native filesystem event. Always
 /// carries a vault-relative, forward-slash-normalized path string -- the
 /// same form [`vault::Note.path`] uses.
+///
+/// The `*Tree` variants carry a directory instead of a note. Native events
+/// name only the directory when one is created, removed, or renamed; the
+/// files under it produce no events of their own [ANW-36].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchAction {
     Upsert(String),
     Delete(String),
+    UpsertTree(String),
+    DeleteTree(String),
 }
 
 /// One debouncer window's worth of coalesced changes.
@@ -39,6 +45,10 @@ pub enum WatchAction {
 pub struct WatchBatch {
     pub upserts: Vec<String>,
     pub deletes: Vec<String>,
+    /// Directories to walk for notes to upsert.
+    pub upsert_trees: Vec<String>,
+    /// Directories whose indexed notes are all gone.
+    pub delete_trees: Vec<String>,
 }
 
 /// Classify one [`Event`] into zero or more [`WatchAction`]s. Dot-segments
@@ -54,60 +64,104 @@ pub fn map_event(event: &Event, vault_root: &Path) -> Vec<WatchAction> {
     let mut actions = Vec::new();
     let action_kind = classify(event.kind);
     match action_kind {
-        Some(EventAction::Upsert) => {
+        Some(EventAction::Modify) => {
+            // Content and metadata events only ever name a file.
             for p in &event.paths {
-                if let Some(rel) = vault_relative(vault_root, p) {
+                if let Some(rel) = note_relative(vault_root, p) {
                     actions.push(WatchAction::Upsert(rel));
                 }
             }
         }
-        Some(EventAction::Delete) => {
+        Some(EventAction::Appear) => {
             for p in &event.paths {
-                if let Some(rel) = vault_relative(vault_root, p) {
-                    actions.push(WatchAction::Delete(rel));
-                }
+                actions.extend(appear(vault_root, p));
+            }
+        }
+        Some(EventAction::Vanish) => {
+            for p in &event.paths {
+                actions.extend(vanish(vault_root, p));
             }
         }
         Some(EventAction::Rename) => {
             // Notify packs (from, to) in event.paths in that order.
-            if let Some(from) = event.paths.first()
-                && let Some(rel) = vault_relative(vault_root, from)
-            {
-                actions.push(WatchAction::Delete(rel));
+            if let Some(from) = event.paths.first() {
+                actions.extend(vanish(vault_root, from));
             }
-            if let Some(to) = event.paths.get(1)
-                && let Some(rel) = vault_relative(vault_root, to)
-            {
-                actions.push(WatchAction::Upsert(rel));
+            if let Some(to) = event.paths.get(1) {
+                actions.extend(appear(vault_root, to));
             }
+        }
+        Some(EventAction::RenameUnpaired) => {
+            // FSEvents (macOS) cannot pair the two sides of a rename and
+            // reports `Modify(Name(Any))` for each side separately, so the
+            // direction has to come off the filesystem [ANW-36].
+            for p in &event.paths {
+                if p.exists() {
+                    actions.extend(appear(vault_root, p));
+                } else {
+                    actions.extend(vanish(vault_root, p));
+                }
+            }
+            // `p.exists()` can only report the moment it is asked. A path
+            // that vanishes right after the probe is caught downstream:
+            // `build_index_batch` turns a not-found upsert into a delete.
         }
         None => {}
     }
     actions
 }
 
+/// A path that now exists: a note to read, or a directory to walk. The
+/// filesystem answers which, so a non-note file (an attachment, an editor
+/// temp file) costs nothing beyond the probe.
+fn appear(vault_root: &Path, abs: &Path) -> Option<WatchAction> {
+    if abs.is_dir() {
+        tree_relative(vault_root, abs).map(WatchAction::UpsertTree)
+    } else {
+        note_relative(vault_root, abs).map(WatchAction::Upsert)
+    }
+}
+
+/// A path that is gone: a note to drop, or a directory whose notes are all
+/// gone with it. The filesystem cannot be asked -- it no longer holds the
+/// entry -- so the decision rests on the path's own shape.
+fn vanish(vault_root: &Path, abs: &Path) -> Option<WatchAction> {
+    if is_markdown(abs) {
+        note_relative(vault_root, abs).map(WatchAction::Delete)
+    } else {
+        tree_relative(vault_root, abs).map(WatchAction::DeleteTree)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventAction {
-    Upsert,
-    Delete,
+    /// Existing file, new content.
+    Modify,
+    /// Path came into the vault.
+    Appear,
+    /// Path left the vault.
+    Vanish,
+    /// Both sides in one event, `(from, to)`.
     Rename,
+    /// One side of a rename, direction unknown.
+    RenameUnpaired,
 }
 
 fn classify(kind: EventKind) -> Option<EventAction> {
     match kind {
-        EventKind::Create(_)
-        | EventKind::Modify(
-            ModifyKind::Data(_)
-            | ModifyKind::Metadata(_)
-            | ModifyKind::Any
-            | ModifyKind::Name(RenameMode::To),
-        )
-        | EventKind::Access(AccessKind::Close(AccessMode::Write)) => Some(EventAction::Upsert),
+        EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Metadata(_) | ModifyKind::Any)
+        | EventKind::Access(AccessKind::Close(AccessMode::Write)) => Some(EventAction::Modify),
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+            Some(EventAction::Appear)
+        }
         EventKind::Modify(ModifyKind::Name(RenameMode::From)) | EventKind::Remove(_) => {
-            Some(EventAction::Delete)
+            Some(EventAction::Vanish)
         }
         EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => Some(EventAction::Rename),
-        // Access(non-close), Modify(Name(Any|Other)), Other, Any -> drop.
+        EventKind::Modify(ModifyKind::Name(RenameMode::Any | RenameMode::Other)) => {
+            Some(EventAction::RenameUnpaired)
+        }
+        // Access(non-close), Other, Any -> drop.
         _ => None,
     }
 }
@@ -120,8 +174,10 @@ pub fn is_overflow(event: &Event) -> bool {
 }
 
 /// Collapse a sequence of [`WatchAction`]s into a single batch. The last
-/// action per path wins (delete-then-upsert ends up as upsert, and so on).
-/// The batch keeps deterministic order by sorting paths inside each list.
+/// action per path wins (delete-then-upsert ends up as upsert, and so on);
+/// notes and directories are tracked separately, since a directory action
+/// covers paths a note action cannot name. The batch keeps deterministic
+/// order by sorting paths inside each list.
 #[must_use]
 pub fn coalesce(actions: impl IntoIterator<Item = WatchAction>) -> WatchBatch {
     #[derive(Clone, Copy)]
@@ -129,36 +185,64 @@ pub fn coalesce(actions: impl IntoIterator<Item = WatchAction>) -> WatchBatch {
         Upsert,
         Delete,
     }
-    let mut state: BTreeMap<String, Last> = BTreeMap::new();
+    let mut notes: BTreeMap<String, Last> = BTreeMap::new();
+    let mut trees: BTreeMap<String, Last> = BTreeMap::new();
     for a in actions {
         match a {
             WatchAction::Upsert(p) => {
-                state.insert(p, Last::Upsert);
+                notes.insert(p, Last::Upsert);
             }
             WatchAction::Delete(p) => {
-                state.insert(p, Last::Delete);
+                notes.insert(p, Last::Delete);
+            }
+            WatchAction::UpsertTree(p) => {
+                trees.insert(p, Last::Upsert);
+            }
+            WatchAction::DeleteTree(p) => {
+                trees.insert(p, Last::Delete);
             }
         }
     }
-    let mut upserts = Vec::new();
-    let mut deletes = Vec::new();
-    for (path, last) in state {
+    let mut batch = WatchBatch::default();
+    for (path, last) in notes {
         match last {
-            Last::Upsert => upserts.push(path),
-            Last::Delete => deletes.push(path),
+            Last::Upsert => batch.upserts.push(path),
+            Last::Delete => batch.deletes.push(path),
         }
     }
-    WatchBatch { upserts, deletes }
+    for (path, last) in trees {
+        match last {
+            Last::Upsert => batch.upsert_trees.push(path),
+            Last::Delete => batch.delete_trees.push(path),
+        }
+    }
+    batch
+}
+
+fn is_markdown(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "md")
 }
 
 /// Filter and normalize an absolute notify path. Returns the vault-relative
 /// forward-slash path if the entry is a `.md` file outside any dot-directory;
 /// returns `None` otherwise (so the caller drops the event).
-fn vault_relative(vault_root: &Path, abs: &Path) -> Option<String> {
-    let rel = abs.strip_prefix(vault_root).ok()?;
-    if rel.extension().is_none_or(|e| e != "md") {
+fn note_relative(vault_root: &Path, abs: &Path) -> Option<String> {
+    if !is_markdown(abs) {
         return None;
     }
+    relative(vault_root, abs)
+}
+
+/// Same, for a directory: any path that is not a note. The vault root itself
+/// relativizes to the empty string and is dropped -- a root-level event is a
+/// vault-wide signal the rescan path handles, not a prefix to delete.
+fn tree_relative(vault_root: &Path, abs: &Path) -> Option<String> {
+    let rel = relative(vault_root, abs)?;
+    if rel.is_empty() { None } else { Some(rel) }
+}
+
+fn relative(vault_root: &Path, abs: &Path) -> Option<String> {
+    let rel = abs.strip_prefix(vault_root).ok()?;
     for component in rel.components() {
         let s = component.as_os_str().to_str()?;
         if s.starts_with('.') {
@@ -226,7 +310,11 @@ pub async fn run_debouncer(
             );
         }
         let batch = coalesce(actions);
-        if batch.upserts.is_empty() && batch.deletes.is_empty() {
+        if batch.upserts.is_empty()
+            && batch.deletes.is_empty()
+            && batch.upsert_trees.is_empty()
+            && batch.delete_trees.is_empty()
+        {
             continue;
         }
         let index_batch = build_index_batch(&vault_root, batch);
@@ -239,10 +327,17 @@ pub async fn run_debouncer(
 
 fn build_index_batch(vault_root: &Path, batch: WatchBatch) -> IndexBatch {
     let mut upserts = Vec::with_capacity(batch.upserts.len());
+    let mut deletes = batch.deletes;
     for rel in batch.upserts {
         let abs = absolute_path(vault_root, &rel);
         match vault::scan_one(vault_root, &abs) {
             Ok(note) => upserts.push(note),
+            // The file is gone by the time we read it. An event backend that
+            // coalesces create-and-remove into one upsert-shaped event would
+            // otherwise leave the entry in the index forever [ANW-36].
+            Err(vault::ScanIssueKind::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                deletes.push(rel);
+            }
             Err(kind) => {
                 tracing::warn!(
                     path = %abs.display(),
@@ -252,9 +347,29 @@ fn build_index_batch(vault_root: &Path, batch: WatchBatch) -> IndexBatch {
             }
         }
     }
+    // A walked directory carries its own prefix delete: the index under that
+    // prefix must match what the walk found. Without it, a directory renamed
+    // out and another renamed in within one window coalesces to a bare
+    // `UpsertTree` -- the delete is lost and the old notes outlive their
+    // files [ANW-36].
+    let mut delete_prefixes = batch.delete_trees;
+    delete_prefixes.extend(batch.upsert_trees.iter().cloned());
+    for dir in &batch.upsert_trees {
+        let abs = absolute_path(vault_root, dir);
+        let result = vault::scan_from(vault_root, &abs);
+        for issue in &result.issues {
+            tracing::warn!(
+                path = %issue.path.display(),
+                error = %issue.kind,
+                "filesystem_watcher: subtree walk issue; skipping note"
+            );
+        }
+        upserts.extend(result.notes);
+    }
     IndexBatch {
         upserts,
-        deletes: batch.deletes,
+        deletes,
+        delete_prefixes,
     }
 }
 
@@ -391,6 +506,142 @@ mod tests {
         let batch = coalesce(actions);
         assert_eq!(batch.upserts, vec!["a.md".to_string(), "b.md".to_string()]);
         assert_eq!(batch.deletes, vec!["c.md".to_string()]);
+    }
+
+    #[test]
+    fn coalesce_keeps_notes_and_trees_apart() {
+        let actions = vec![
+            WatchAction::Upsert("Notes/a.md".into()),
+            WatchAction::DeleteTree("Notes".into()),
+            WatchAction::UpsertTree("Fresh".into()),
+        ];
+        let batch = coalesce(actions);
+        assert_eq!(batch.upserts, vec!["Notes/a.md".to_string()]);
+        assert!(batch.deletes.is_empty());
+        assert_eq!(batch.upsert_trees, vec!["Fresh".to_string()]);
+        assert_eq!(batch.delete_trees, vec!["Notes".to_string()]);
+    }
+
+    #[test]
+    fn removed_directory_is_a_tree_delete() {
+        let e = ev(EventKind::Remove(RemoveKind::Folder), &["/v/Notes"]);
+        assert_eq!(
+            map_event(&e, &vault()),
+            vec![WatchAction::DeleteTree("Notes".into())]
+        );
+    }
+
+    #[test]
+    fn directory_renamed_away_is_a_tree_delete() {
+        let e = ev(
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            &["/v/Notes"],
+        );
+        assert_eq!(
+            map_event(&e, &vault()),
+            vec![WatchAction::DeleteTree("Notes".into())]
+        );
+    }
+
+    #[test]
+    fn vault_root_itself_is_not_a_tree_action() {
+        let e = ev(EventKind::Remove(RemoveKind::Folder), &["/v"]);
+        assert!(map_event(&e, &vault()).is_empty());
+    }
+
+    #[test]
+    fn removed_non_note_file_touches_no_note() {
+        // A vanished path with no `.md` suffix is treated as a directory;
+        // the prefix simply matches nothing in the store.
+        let e = ev(EventKind::Remove(RemoveKind::File), &["/v/image.png"]);
+        assert_eq!(
+            map_event(&e, &vault()),
+            vec![WatchAction::DeleteTree("image.png".into())]
+        );
+    }
+
+    #[test]
+    fn created_directory_is_a_tree_upsert() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("Notes")).unwrap();
+        let e = ev(EventKind::Create(CreateKind::Folder), &[]).add_path(root.path().join("Notes"));
+        assert_eq!(
+            map_event(&e, root.path()),
+            vec![WatchAction::UpsertTree("Notes".into())]
+        );
+    }
+
+    #[test]
+    fn unpaired_rename_resolves_by_existence() {
+        // FSEvents (macOS) reports each side of a rename as
+        // `Modify(Name(Any))` with no way to pair them.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("here.md"), "x").unwrap();
+        let kind = EventKind::Modify(ModifyKind::Name(RenameMode::Any));
+
+        let present = ev(kind, &[]).add_path(root.path().join("here.md"));
+        assert_eq!(
+            map_event(&present, root.path()),
+            vec![WatchAction::Upsert("here.md".into())]
+        );
+
+        let absent = ev(kind, &[]).add_path(root.path().join("gone.md"));
+        assert_eq!(
+            map_event(&absent, root.path()),
+            vec![WatchAction::Delete("gone.md".into())]
+        );
+    }
+
+    #[test]
+    fn upsert_of_a_vanished_file_becomes_a_delete() {
+        let root = tempfile::tempdir().unwrap();
+        let batch = WatchBatch {
+            upserts: vec!["gone.md".to_string()],
+            ..WatchBatch::default()
+        };
+        let index_batch = build_index_batch(root.path(), batch);
+        assert!(index_batch.upserts.is_empty());
+        assert_eq!(index_batch.deletes, vec!["gone.md".to_string()]);
+    }
+
+    #[test]
+    fn tree_upsert_walks_the_subtree() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("Notes/deep")).unwrap();
+        std::fs::write(root.path().join("Notes/a.md"), "---\nk: 1\n---\nbody\n").unwrap();
+        std::fs::write(root.path().join("Notes/deep/b.md"), "body\n").unwrap();
+        std::fs::write(root.path().join("Notes/skip.txt"), "no\n").unwrap();
+        std::fs::write(root.path().join("outside.md"), "no\n").unwrap();
+
+        let batch = WatchBatch {
+            upsert_trees: vec!["Notes".to_string()],
+            ..WatchBatch::default()
+        };
+        let index_batch = build_index_batch(root.path(), batch);
+        let mut paths: Vec<String> = index_batch.upserts.into_iter().map(|n| n.path).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["Notes/a.md", "Notes/deep/b.md"]);
+    }
+
+    #[test]
+    fn tree_upsert_carries_its_prefix_delete() {
+        // One directory renamed out and another renamed in within one window
+        // coalesces to a bare `UpsertTree`; the walk must still drop whatever
+        // the old directory left in the index [ANW-36].
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("Notes")).unwrap();
+        std::fs::write(root.path().join("Notes/new.md"), "body\n").unwrap();
+
+        let batch = coalesce([
+            WatchAction::DeleteTree("Notes".to_string()),
+            WatchAction::UpsertTree("Notes".to_string()),
+        ]);
+        assert!(batch.delete_trees.is_empty());
+
+        let index_batch = build_index_batch(root.path(), batch);
+        assert_eq!(index_batch.delete_prefixes, vec!["Notes".to_string()]);
+        let paths: Vec<String> = index_batch.upserts.into_iter().map(|n| n.path).collect();
+        assert_eq!(paths, vec!["Notes/new.md"]);
     }
 
     #[test]

@@ -442,6 +442,14 @@ pub enum IndexWriterMessage {
 pub struct IndexBatch {
     pub upserts: Vec<Note>,
     pub deletes: Vec<String>,
+    /// Directories whose indexed notes all drop before the upserts land. A
+    /// removed or renamed directory produces no per-file event, so the
+    /// prefix is the only handle on those notes. A directory that was
+    /// walked is listed here too: the index under that prefix has to match
+    /// the walk, not keep what an earlier directory of the same name left
+    /// behind [ANW-36].
+    #[serde(default)]
+    pub delete_prefixes: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -498,8 +506,15 @@ impl GenServer for IndexWriterState {
             }
             IndexWriterMessage::Batch(batch) => {
                 let (u, d) = (batch.upserts.len(), batch.deletes.len());
-                self.store.apply_batch(batch.upserts, &batch.deletes);
-                tracing::info!(upserts = u, deletes = d, "index_writer: batch applied");
+                let dropped =
+                    self.store
+                        .apply_batch(batch.upserts, &batch.deletes, &batch.delete_prefixes);
+                tracing::info!(
+                    upserts = u,
+                    deletes = d,
+                    dropped,
+                    "index_writer: batch applied"
+                );
             }
             IndexWriterMessage::Upsert(note) => {
                 let path = note.path.clone();

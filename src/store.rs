@@ -40,19 +40,45 @@ impl NoteStore {
         }
     }
 
-    /// Apply one debounce-window's worth of changes. Mirrors the order in
-    /// [`crate::index::NoteIndex::apply_batch`]: deletes first, then upserts.
+    /// Apply one debounce-window's worth of changes: deletes first (paths,
+    /// then whole directories), then upserts. A "delete-then-upsert"
+    /// sequence on one path is therefore unambiguous, and a directory that
+    /// was removed and recreated inside one window keeps only what the walk
+    /// found.
+    ///
+    /// Each entry of `delete_prefixes` is a vault-relative directory; every
+    /// note under it drops [ANW-36]. Returns the number of notes dropped
+    /// that way.
     ///
     /// # Panics
     /// Panics if the inner `RwLock` has been poisoned.
-    pub fn apply_batch(&self, upserts: Vec<Note>, deletes: &[String]) {
+    pub fn apply_batch(
+        &self,
+        upserts: Vec<Note>,
+        deletes: &[String],
+        delete_prefixes: &[String],
+    ) -> usize {
         let mut guard = self.inner.write().expect("note_store: write lock poisoned");
         for path in deletes {
             guard.remove(path);
         }
+        let mut dropped = 0;
+        for dir in delete_prefixes {
+            let prefix = format!("{}/", dir.trim_end_matches('/'));
+            let doomed: Vec<String> = guard
+                .range(prefix.clone()..)
+                .take_while(|(p, _)| p.starts_with(&prefix))
+                .map(|(p, _)| p.clone())
+                .collect();
+            dropped += doomed.len();
+            for path in doomed {
+                guard.remove(&path);
+            }
+        }
         for note in upserts {
             guard.insert(note.path.clone(), note);
         }
+        dropped
     }
 
     /// # Panics
@@ -143,11 +169,40 @@ mod tests {
     fn apply_batch_deletes_then_upserts() {
         let s = NoteStore::new();
         s.replace(vec![note("a.md"), note("b.md")]);
-        s.apply_batch(vec![note("c.md")], &["a.md".to_string()]);
+        s.apply_batch(vec![note("c.md")], &["a.md".to_string()], &[]);
         assert_eq!(s.len(), 2);
         assert!(s.get("a.md").is_none());
         assert!(s.get("b.md").is_some());
         assert!(s.get("c.md").is_some());
+    }
+
+    #[test]
+    fn apply_batch_prefix_drops_the_whole_subtree() {
+        let s = NoteStore::new();
+        s.replace(vec![
+            note("Notes/a.md"),
+            note("Notes/deep/b.md"),
+            note("Notesy/c.md"),
+            note("Other/d.md"),
+        ]);
+        let dropped = s.apply_batch(vec![], &[], &["Notes".to_string()]);
+        assert_eq!(dropped, 2);
+        assert!(s.get("Notes/a.md").is_none());
+        assert!(s.get("Notes/deep/b.md").is_none());
+        // A sibling sharing the prefix as a string, but not as a directory.
+        assert!(s.get("Notesy/c.md").is_some());
+        assert!(s.get("Other/d.md").is_some());
+    }
+
+    #[test]
+    fn apply_batch_prefix_delete_precedes_upserts() {
+        let s = NoteStore::new();
+        s.replace(vec![note("Notes/gone.md")]);
+        // A directory removed and recreated inside one window: only what the
+        // walk found survives.
+        s.apply_batch(vec![note("Notes/fresh.md")], &[], &["Notes".to_string()]);
+        assert!(s.get("Notes/gone.md").is_none());
+        assert!(s.get("Notes/fresh.md").is_some());
     }
 
     #[test]
