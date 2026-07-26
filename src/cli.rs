@@ -4,18 +4,22 @@
 //!
 //! ```text
 //! anwesen serve  --vault <path> [--bind <addr:port>] [--log-level <level>]
-//!                [--uptrace-dsn <dsn> | --otlp-endpoint <url>]
-//!                [--otlp-header <key=value>]... [--otlp-slow-request-ms <n>]
+//!                [--otlp-slow-request-ms <n>]
 //! anwesen doctor --vault <path> [--log-level <level>]
 //! anwesen merge  --vault <path> [--query <string>] [--log-level <level>]
 //! anwesen version
 //! ```
 //!
-//! `--bind` and the OTLP telemetry flags are `serve`-only ([ANW-37]);
+//! `--bind` and `--otlp-slow-request-ms` are `serve`-only ([ANW-37]);
 //! `doctor` and `merge` do not bind a port; `version` takes no flags. Each
 //! flag has a matching `ANWESEN_<UPPER>` environment variable and CLI wins
-//! over env per the manual. With no `--otlp-endpoint`/`--uptrace-dsn`,
-//! telemetry is off and the server behaves exactly as without these flags.
+//! over env per the manual.
+//!
+//! Telemetry export is configured through the standard `OTEL_EXPORTER_OTLP_*`
+//! environment variables ([ANW-42](https://crvrs.youtrack.cloud/issue/ANW-42)).
+//! With none of them set, telemetry is off and the server behaves as it did
+//! before telemetry existed. The removed flags below are still parsed so an
+//! upgrade fails loudly instead of dropping export config in silence.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -56,25 +60,22 @@ pub struct ServeArgs {
     #[arg(long, env = "ANWESEN_LOG_LEVEL", default_value = "info")]
     pub log_level: LogLevel,
 
-    /// uptrace DSN shorthand (`https://<token>@api.uptrace.dev`), parsed
-    /// into the OTLP endpoint plus an `uptrace-dsn` header. Mutually
-    /// exclusive with --otlp-endpoint. When this and --otlp-endpoint are
-    /// both unset, telemetry is fully off (ANW-37).
-    #[arg(long, env = "ANWESEN_UPTRACE_DSN")]
+    /// Removed (ANW-42): use `OTEL_EXPORTER_OTLP_ENDPOINT` plus
+    /// `OTEL_EXPORTER_OTLP_HEADERS=uptrace-dsn=<dsn>`. Still accepted so
+    /// startup fails with that message rather than exporting nowhere.
+    #[arg(long, env = "ANWESEN_UPTRACE_DSN", hide = true)]
     pub uptrace_dsn: Option<String>,
 
-    /// Generic OTLP/HTTP endpoint base URL for telemetry export. The
-    /// per-signal path (`/v1/metrics`, `/v1/traces`) is appended by the
-    /// exporter. Mutually exclusive with --uptrace-dsn.
-    #[arg(long, env = "ANWESEN_OTLP_ENDPOINT")]
+    /// Removed (ANW-42): use `OTEL_EXPORTER_OTLP_ENDPOINT`.
+    #[arg(long, env = "ANWESEN_OTLP_ENDPOINT", hide = true)]
     pub otlp_endpoint: Option<String>,
 
-    /// Extra OTLP export header as `key=value`, repeatable. On the env var
-    /// (`ANWESEN_OTLP_HEADERS`) pass a comma-separated `key=value` list.
+    /// Removed (ANW-42): use `OTEL_EXPORTER_OTLP_HEADERS`.
     #[arg(
         long = "otlp-header",
         env = "ANWESEN_OTLP_HEADERS",
-        value_delimiter = ','
+        value_delimiter = ',',
+        hide = true
     )]
     pub otlp_headers: Vec<String>,
 
@@ -167,6 +168,34 @@ mod tests {
                 assert_eq!(a.vault, PathBuf::from("/tmp/v"));
                 assert_eq!(a.bind, "0.0.0.0:9000".parse::<SocketAddr>().unwrap());
                 assert!(matches!(a.log_level, LogLevel::Debug));
+            }
+            _ => panic!("expected serve"),
+        }
+    }
+
+    /// The removed telemetry flags still parse, hidden from `--help`. Clap
+    /// rejecting them as unknown would say nothing about the `OTEL_`
+    /// replacement; the migration error in `telemetry::TelemetryConfig`
+    /// needs the values to reach it (ANW-42).
+    #[test]
+    fn serve_still_parses_the_removed_telemetry_flags() {
+        let cli = parse(&[
+            "serve",
+            "--vault",
+            "/tmp/v",
+            "--uptrace-dsn",
+            "https://tok@api.uptrace.dev",
+            "--otlp-endpoint",
+            "https://collector.example.com",
+            "--otlp-header",
+            "authorization=Bearer xyz",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Serve(a) => {
+                assert!(a.uptrace_dsn.is_some());
+                assert!(a.otlp_endpoint.is_some());
+                assert_eq!(a.otlp_headers, vec!["authorization=Bearer xyz".to_string()]);
             }
             _ => panic!("expected serve"),
         }

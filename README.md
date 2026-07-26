@@ -56,8 +56,7 @@ anwesen merge --vault /path/to/vault --query 'tags=adr&__anw-order=title' > ADRs
 
 ```
 anwesen serve  --vault <path> [--bind <addr:port>] [--log-level <level>]
-               [--uptrace-dsn <dsn> | --otlp-endpoint <url>]
-               [--otlp-header <key=value>]... [--otlp-slow-request-ms <n>]
+               [--otlp-slow-request-ms <n>]
 anwesen doctor --vault <path>
 anwesen merge  --vault <path> --query <query-string>
 anwesen version
@@ -69,23 +68,61 @@ anwesen version
 | `--bind <addr:port>`        | `ANWESEN_BIND`                 | `127.0.0.1:8080`       | Listen address for `serve`.                                                   |
 | `--log-level <level>`       | `ANWESEN_LOG_LEVEL`            | `info`                 | `error`, `warn`, `info`, `debug`, or `trace`.                                  |
 | `--query <query-string>`    | --                             | _required for `merge`_ | A `/query` query string: frontmatter predicates plus `__anw-` controls.       |
-| `--uptrace-dsn <dsn>`       | `ANWESEN_UPTRACE_DSN`          | unset                  | uptrace DSN (`https://<token>@api.uptrace.dev`). Excludes `--otlp-endpoint`.  |
-| `--otlp-endpoint <url>`     | `ANWESEN_OTLP_ENDPOINT`        | unset                  | OTLP/HTTP base URL. Excludes `--uptrace-dsn`.                                 |
-| `--otlp-header <key=value>` | `ANWESEN_OTLP_HEADERS`         | none                   | Extra export header, repeatable. The env var takes a comma-separated list.    |
 | `--otlp-slow-request-ms`    | `ANWESEN_OTLP_SLOW_REQUEST_MS` | `500`                  | Requests at or over this duration, or answering 5xx, also export a span.      |
 
-Every flag has a matching `ANWESEN_<UPPER>` environment variable, except
-`--otlp-header`, whose env var is the plural `ANWESEN_OTLP_HEADERS` because it
-takes a list. CLI flags win over env vars.
+Every flag has a matching `ANWESEN_<UPPER>` environment variable. CLI flags win
+over env vars.
 
-Telemetry is off unless `--uptrace-dsn` or `--otlp-endpoint` is set. With
-neither, nothing is exported and no exporter is built. The four telemetry
-flags apply to `serve` only.
+`--bind` and `--otlp-slow-request-ms` apply to `serve` only. Where telemetry is
+exported is configured entirely through the standard `OTEL_` variables below.
 
 - **`serve`** -- run the daemon: walk the vault, build the index, watch for changes, serve the API.
 - **`doctor`** -- walk the vault once and report what would stop clean ingestion: unreadable files, unparseable YAML, path collisions on the HTTP surface, and frontmatter type drift (the same key carrying incompatible types across notes). Read-only; non-zero exit if any issue is found.
 - **`merge`** -- one-shot local generation: walk the vault, evaluate `--query`, and write the merged markdown document to stdout. No server, no HTTP. See [Local generation](#local-generation).
 - **`version`** -- print version and exit.
+
+## Telemetry
+
+anwesen exports OTLP metrics for every request, and a span for requests at or
+over `--otlp-slow-request-ms` or answering a 5xx. Export is configured through
+the standard OpenTelemetry environment variables, which the SDK reads directly:
+
+| Variable                               | Meaning                                                          |
+| -------------------------------------- | ---------------------------------------------------------------- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`          | Base URL. The SDK appends `/v1/metrics` and `/v1/traces`.        |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`  | Full metrics URL, used as given. Overrides the base for metrics. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`   | Full traces URL, used as given. Overrides the base for traces.   |
+| `OTEL_EXPORTER_OTLP_HEADERS`           | Export headers, `key=value` comma-separated.                     |
+| `OTEL_EXPORTER_OTLP_PROTOCOL`          | `http/protobuf`, the default and the only value this build speaks. |
+| `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | Override the `anwesen` service identity.                |
+
+The per-signal `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` and
+`OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` are read the same way.
+
+With none of the three endpoint variables set, telemetry is off: no exporter is
+built and the request middleware is not installed.
+
+Two settings fail at startup rather than export nowhere in silence:
+
+- A query or a fragment on `OTEL_EXPORTER_OTLP_ENDPOINT`. The base URL must be
+  a base URL; the SDK appends the signal path after whatever it is given.
+- A protocol other than `http/protobuf`. The binary ships the OTLP/HTTP
+  transport alone, so `grpc` would keep exporting over HTTP with nothing in the
+  log. Point the endpoint at the collector's HTTP port, not its gRPC one.
+
+uptrace:
+
+```
+OTEL_EXPORTER_OTLP_ENDPOINT=https://api.uptrace.dev
+OTEL_EXPORTER_OTLP_HEADERS=uptrace-dsn=https://TOKEN@api.uptrace.dev?grpc=4317
+```
+
+Paste the DSN from Project Settings into the header verbatim, tail and all --
+it is a credential there, not an address. The endpoint is the host alone.
+
+Removed in 0.3.0: `--uptrace-dsn`, `--otlp-endpoint`, `--otlp-header` and their
+`ANWESEN_` variables. Passing any of them fails at startup with the `OTEL_`
+replacement to use.
 
 ## HTTP API
 

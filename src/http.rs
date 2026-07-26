@@ -819,18 +819,23 @@ mod tests {
     }
 
     /// With telemetry installed, a normal request is answered byte-for-byte
-    /// as without it. The exporter points at an unreachable local port, so
-    /// export fails instantly in the background and never touches the
-    /// response path.
+    /// as without it. The test process sets no `OTEL_EXPORTER_OTLP_*`
+    /// variables, so the exporter aims at the SDK default and fails in the
+    /// background without ever touching the response path.
     #[tokio::test]
     async fn telemetry_layer_does_not_alter_responses() {
-        use crate::telemetry::{self, RawTelemetryArgs, TelemetryConfig};
+        use crate::telemetry::{self, OtelEnv, RawTelemetryArgs, TelemetryConfig};
 
-        let cfg = TelemetryConfig::resolve(RawTelemetryArgs {
-            otlp_endpoint: Some("http://127.0.0.1:9".into()),
-            slow_request_ms: 500,
-            ..Default::default()
-        })
+        let cfg = TelemetryConfig::resolve(
+            &RawTelemetryArgs {
+                slow_request_ms: 500,
+                ..Default::default()
+            },
+            OtelEnv {
+                endpoint: Some("http://127.0.0.1:9".into()),
+                ..OtelEnv::default()
+            },
+        )
         .unwrap()
         .expect("telemetry on");
         let tel = Arc::new(telemetry::init(cfg).expect("telemetry init"));

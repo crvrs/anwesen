@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anwesen::app::Anwesen;
 use anwesen::doctor;
 use anwesen::merge;
-use anwesen::telemetry::{self, RawTelemetryArgs, TelemetryConfig};
+use anwesen::telemetry::{self, OtelEnv, RawTelemetryArgs, TelemetryConfig};
 use anyhow::Result;
 use clap::Parser;
 use hydra::Application;
@@ -25,14 +25,18 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Serve(args) => {
             init_logging(args.log_level);
-            // Resolve telemetry config before the supervisor starts; an
-            // unset endpoint leaves it `None` (export off, behaves as today).
-            let telemetry = match TelemetryConfig::resolve(RawTelemetryArgs {
-                uptrace_dsn: args.uptrace_dsn,
-                otlp_endpoint: args.otlp_endpoint,
-                otlp_headers: args.otlp_headers,
-                slow_request_ms: args.otlp_slow_request_ms,
-            })? {
+            // Resolve telemetry config before the supervisor starts; no
+            // OTEL_EXPORTER_OTLP_* endpoint leaves it `None` (export off,
+            // no middleware). A removed flag is a startup error (ANW-42).
+            let telemetry = match TelemetryConfig::resolve(
+                &RawTelemetryArgs {
+                    uptrace_dsn: args.uptrace_dsn,
+                    otlp_endpoint: args.otlp_endpoint,
+                    otlp_headers: args.otlp_headers,
+                    slow_request_ms: args.otlp_slow_request_ms,
+                },
+                OtelEnv::from_env(),
+            )? {
                 Some(cfg) => Some(Arc::new(telemetry::init(cfg)?)),
                 None => None,
             };
