@@ -121,6 +121,12 @@ pub struct Anwesen {
     /// Request-level telemetry handle ([ANW-37]). `None` disables export and
     /// the request middleware entirely.
     pub telemetry: Option<Arc<Telemetry>>,
+    /// Set once the supervisor tree is up. Hydra's `Application::run` logs a
+    /// start failure and returns normally, so `serve` cannot tell a clean
+    /// shutdown from a tree that never came up. `main` reads this after `run`
+    /// and exits nonzero when it is still false, which is what lets systemd
+    /// retry ([ANW-45](https://crvrs.youtrack.cloud/issue/ANW-45)).
+    pub started: Arc<AtomicBool>,
 }
 
 impl Anwesen {
@@ -133,6 +139,7 @@ impl Anwesen {
             store: NoteStore::new(),
             health: HealthState::new(),
             telemetry,
+            started: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -187,10 +194,12 @@ impl Application for Anwesen {
             .child_spec(),
         ];
 
-        Supervisor::with_children(children)
+        let pid = Supervisor::with_children(children)
             .strategy(SupervisionStrategy::OneForOne)
             .start_link(SupervisorOptions::new().name("anwesen_root"))
-            .await
+            .await?;
+        self.started.store(true, Ordering::Release);
+        Ok(pid)
     }
 }
 

@@ -6,6 +6,7 @@
 mod cli;
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use anwesen::app::Anwesen;
 use anwesen::doctor;
@@ -46,11 +47,21 @@ fn main() -> Result<()> {
                 telemetry = telemetry.is_some(),
                 "anwesen serve: starting supervisor tree"
             );
+            let app = Anwesen::new(args.vault, args.bind, telemetry.clone());
+            let started = app.started.clone();
             // Blocks until the supervisor exits (SIGTERM / SIGINT / crash).
-            Anwesen::new(args.vault, args.bind, telemetry.clone()).run();
+            app.run();
             // Flush and shut down exporters after the server loop returns.
             if let Some(telemetry) = telemetry {
                 telemetry.shutdown();
+            }
+            // `run` returns normally whether the tree came up or never
+            // started, so a failed start would otherwise look like a clean
+            // exit and systemd's `Restart=on-failure` would not retry
+            // (ANW-45). Exit nonzero when the tree never came up.
+            if !started.load(Ordering::Acquire) {
+                tracing::error!("anwesen serve: supervisor tree failed to start");
+                std::process::exit(1);
             }
         }
         Command::Doctor(args) => {
