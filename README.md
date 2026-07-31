@@ -22,7 +22,7 @@ Anwesen answers three kinds of question over HTTP:
 
 The frontmatter index is built once at startup and kept current by watching the vault directory. The index lives in memory; a restart rebuilds it, and there is nothing on disk to corrupt or migrate.
 
-The same query-and-merge engine also runs offline, with no server: `anwesen merge` walks a directory, evaluates a query, and writes the merged markdown to stdout (see [Local generation](#local-generation)).
+The same query-and-merge engine also runs offline, with no server. `anwesen merge` walks a directory, evaluates a query, and writes the merged markdown to stdout; `anwesen query` writes the same JSON document `GET /query` returns (see [Local generation](#local-generation)).
 
 ## Quick start
 
@@ -52,6 +52,12 @@ Build one file out of many notes, without starting the daemon:
 anwesen merge --vault /path/to/vault --query 'tags=adr&__anw-order=title' > ADRs.md
 ```
 
+Ask which notes match, and what their frontmatter holds, without starting the daemon:
+
+```
+anwesen query --vault /path/to/vault --query 'tags=adr' | jq -r '.results[].path'
+```
+
 ## CLI
 
 ```
@@ -59,6 +65,7 @@ anwesen serve  --vault <path> [--bind <addr:port>] [--log-level <level>]
                [--otlp-slow-request-ms <n>]
 anwesen doctor --vault <path>
 anwesen merge  --vault <path> --query <query-string>
+anwesen query  --vault <path> --query <query-string>
 anwesen version
 ```
 
@@ -67,7 +74,7 @@ anwesen version
 | `--vault <path>`            | `ANWESEN_VAULT`                | _required_             | Path to the vault root.                                                       |
 | `--bind <addr:port>`        | `ANWESEN_BIND`                 | `127.0.0.1:8080`       | Listen address for `serve`.                                                   |
 | `--log-level <level>`       | `ANWESEN_LOG_LEVEL`            | `info`                 | `error`, `warn`, `info`, `debug`, or `trace`.                                  |
-| `--query <query-string>`    | --                             | _required for `merge`_ | A `/query` query string: frontmatter predicates plus `__anw-` controls.       |
+| `--query <query-string>`    | `ANWESEN_QUERY`                | empty (match all)      | A `/query` query string: frontmatter predicates plus `__anw-` controls. `merge` and `query` only. |
 | `--otlp-slow-request-ms`    | `ANWESEN_OTLP_SLOW_REQUEST_MS` | `500`                  | Requests at or over this duration, or answering 5xx, also export a span.      |
 
 Every flag has a matching `ANWESEN_<UPPER>` environment variable. CLI flags win
@@ -79,6 +86,7 @@ exported is configured entirely through the standard `OTEL_` variables below.
 - **`serve`** -- run the daemon: walk the vault, build the index, watch for changes, serve the API.
 - **`doctor`** -- walk the vault once and report what would stop clean ingestion: unreadable files, unparseable YAML, path collisions on the HTTP surface, and frontmatter type drift (the same key carrying incompatible types across notes). Read-only; non-zero exit if any issue is found.
 - **`merge`** -- one-shot local generation: walk the vault, evaluate `--query`, and write the merged markdown document to stdout. No server, no HTTP. See [Local generation](#local-generation).
+- **`query`** -- the same one-shot walk, writing the JSON document `GET /query` returns: which notes match, and what their frontmatter, `last_modified`, `etag` and `size` hold. No server, no HTTP. See [Local generation](#local-generation).
 - **`version`** -- print version and exit.
 
 ## Telemetry
@@ -173,7 +181,7 @@ ISO-8601 dates and RFC 3339 datetimes are coerced to typed dates at read time, s
 | `__anw-order=<key>[:asc\|:desc]` | path order | Order fragments (merge mode only).                                                             |
 | `__anw-kind=<key>`               | off        | Refuse a mixed merge unless every matched note shares one value for the key (merge mode only). |
 
-By default `/query` returns metadata only; fetch bodies with `/notes/<path>`.
+By default `/query` returns metadata only; fetch bodies with `/notes/<path>`. The same JSON document is available offline, without the daemon, via `anwesen query` (see [Local generation](#local-generation)).
 
 #### Markdown-merge mode
 
@@ -201,7 +209,11 @@ Returns vault path, note count, last index/event timestamps, watcher state, an i
 
 ## Local generation
 
-`anwesen merge` produces the markdown-merge document on the command line, with no server and no HTTP round-trip. It walks the vault, evaluates the query, and writes the merged document to stdout:
+Two subcommands answer a query on the command line, with no server and no HTTP round-trip: `merge` writes the merged markdown document, `query` writes the JSON projection. Both take the same `--vault` and `--query` flags, both walk the vault once, and both run the engine the endpoint runs -- so the output matches what the daemon would have returned for the same vault and query.
+
+### `merge`
+
+`anwesen merge` walks the vault, evaluates the query, and writes the merged document to stdout:
 
 ```
 anwesen merge --vault /path/to/vault --query 'tags=adr&__anw-order=title&__anw-kind=kind'
@@ -210,6 +222,24 @@ anwesen merge --vault /path/to/vault --query 'tags=adr&__anw-order=title&__anw-k
 The `--query` string is the exact `/query` grammar: frontmatter predicates plus the `__anw-` controls, including `__anw-order` for fragment order and `__anw-kind` for the homogeneity guard. The output is byte-identical to the HTTP merge mode for the same vault and query -- both run the same engine. A `__anw-kind` violation exits non-zero and names the offending values on stderr; an empty match set writes nothing and exits `0`.
 
 This is the materialization path: build a `CLAUDE.md`, a skill bundle, or any single file assembled from many notes, driven from a script or a one-off shell.
+
+### `query`
+
+`anwesen query` answers the other half: which notes match, and what their frontmatter holds. It writes the same JSON document `GET /query` returns -- `results`, `total`, `truncated`, with `path`, `frontmatter`, `last_modified`, `etag` and `size` per row -- on one line, ready for `jq`:
+
+```
+anwesen query --vault /path/to/vault --query 'kind=PDR&__anw-limit=1'
+```
+
+```json
+{"results":[{"path":"Projects/PDR-001-intro.md","frontmatter":{"kind":"PDR","num":1,"title":"PDR-001 Intro"},"last_modified":"2026-05-14T17:05:08Z","etag":"\"f657eab5...\"","size":57}],"total":2,"truncated":true}
+```
+
+`total` counts the full match set; `truncated` says the cap cut it.
+
+Bodies are elided here as they are on the endpoint; `merge` is the way to get them offline. `__anw-order` and `__anw-kind` are merge-mode controls and do not affect this output. A malformed query or an unreadable vault exits non-zero with the reason on stderr; an empty match set is an empty `results` list and exit `0`.
+
+A script can therefore move between the daemon and the CLI without a second parser: same shape, same field names, same timestamp dialect.
 
 ## Design notes
 

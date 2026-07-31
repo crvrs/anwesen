@@ -1,6 +1,6 @@
 //! Anwesen: read-only HTTP daemon over a markdown vault.
 //!
-//! This module wires the CLI to the `serve`, `doctor`, `merge`, and
+//! This module wires the CLI to the `serve`, `doctor`, `merge`, `query`, and
 //! `version` subcommands.
 
 mod cli;
@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 
 use anwesen::app::Anwesen;
 use anwesen::doctor;
-use anwesen::merge;
+use anwesen::oneshot;
 use anwesen::telemetry::{self, OtelEnv, RawTelemetryArgs, TelemetryConfig};
 use anyhow::Result;
 use clap::Parser;
@@ -74,13 +74,26 @@ fn main() -> Result<()> {
         }
         Command::Merge(args) => {
             init_logging(args.log_level);
-            match merge::run(&args.vault, &args.query) {
+            match oneshot::merge(&args.vault, &args.query) {
                 // `print!`, not `println!`: the merged document is byte-stable
                 // and byte-identical to the HTTP merge body, which carries no
                 // trailing newline. An empty match set prints nothing, exit 0.
                 Ok(doc) => print!("{doc}"),
                 Err(e) => {
-                    eprint!("{}", e.render());
+                    eprint!("{}", e.render("merge"));
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Query(args) => {
+            init_logging(args.log_level);
+            match oneshot::query_json(&args.vault, &args.query) {
+                // `println!` here, unlike `merge`: the JSON body carries no
+                // trailing newline either, but stdout is one document per
+                // line for the shells and `jq` pipelines this exists for.
+                Ok(doc) => println!("{doc}"),
+                Err(e) => {
+                    eprint!("{}", e.render("query"));
                     std::process::exit(1);
                 }
             }

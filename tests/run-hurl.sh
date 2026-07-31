@@ -54,6 +54,20 @@ if [[ $ready -ne 1 ]]; then
     exit 1
 fi
 
+# ANW-43: the offline `query` subcommand must return the document the endpoint
+# returns. Both surfaces read the same fixture vault, so the two outputs are
+# compared byte for byte before the contract suite runs.
+for q in "" "tags=project" "__anw-path=Projects&__anw-limit=1" "status__exists=true"; do
+    cli="$("$BIN" query --vault "$VAULT" --query "$q" --log-level error)"
+    http="$(curl -sf "http://$HOST:$PORT/query?$q")"
+    if [[ "$cli" != "$http" ]]; then
+        echo "anwesen query and GET /query disagree for query '$q'" >&2
+        echo "  cli:  $cli" >&2
+        echo "  http: $http" >&2
+        exit 1
+    fi
+done
+
 # Run every *.hurl. Glob into an array so we can fail loud if there are none.
 shopt -s globstar nullglob
 files=("$ROOT"/tests/hurl/**/*.hurl)

@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, NaiveDate};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -278,6 +278,16 @@ fn hex_value(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+/// Canonical RFC 3339 form with a `Z` suffix -- the shape the User Manual
+/// example uses for `last_modified`. It lives next to [`ResultEntry`] because
+/// it is the projection's dialect: both the HTTP handlers and the offline
+/// `anwesen query` subcommand ([ANW-43]) format timestamps with it, so the
+/// two surfaces cannot drift.
+#[must_use]
+pub fn rfc3339_z(dt: DateTime<Utc>) -> String {
+    dt.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 /// One result row in the `/query` response. Per User Manual the body is

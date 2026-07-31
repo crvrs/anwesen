@@ -7,8 +7,13 @@
 //!                [--otlp-slow-request-ms <n>]
 //! anwesen doctor --vault <path> [--log-level <level>]
 //! anwesen merge  --vault <path> [--query <string>] [--log-level <level>]
+//! anwesen query  --vault <path> [--query <string>] [--log-level <level>]
 //! anwesen version
 //! ```
+//!
+//! `merge` and `query` differ only in what they write -- the merged markdown
+//! document or the `/query` JSON projection ([ANW-43]) -- so they share one
+//! [`VaultQueryArgs`] flag set and cannot drift.
 //!
 //! `--bind` and `--otlp-slow-request-ms` are `serve`-only ([ANW-37]);
 //! `doctor` and `merge` do not bind a port; `version` takes no flags. Each
@@ -41,7 +46,11 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Walk the vault once, evaluate the query, and write the merged markdown
     /// document to stdout. One-shot; no server. Read-only.
-    Merge(MergeArgs),
+    Merge(VaultQueryArgs),
+    /// Walk the vault once, evaluate the query, and write the same JSON
+    /// document `GET /query` returns to stdout. One-shot; no server.
+    /// Read-only.
+    Query(VaultQueryArgs),
     /// Print the version and exit.
     Version,
 }
@@ -97,8 +106,9 @@ pub struct DoctorArgs {
     pub log_level: LogLevel,
 }
 
+/// Flags shared by the two one-shot subcommands, `merge` and `query`.
 #[derive(Debug, clap::Args)]
-pub struct MergeArgs {
+pub struct VaultQueryArgs {
     /// Path to the vault root.
     #[arg(long, env = "ANWESEN_VAULT")]
     pub vault: PathBuf,
@@ -106,12 +116,12 @@ pub struct MergeArgs {
     /// Query in the `/query` query-string grammar, for example
     /// `tags=anwesen&__anw-kind=skill&__anw-order=order`. The `__anw-kind`
     /// homogeneity guard and `__anw-order` fragment ordering ride inside this
-    /// string -- there are no separate flags. Empty merges every note under
-    /// the vault root.
+    /// string -- there are no separate flags. `__anw-kind` and `__anw-order`
+    /// apply to `merge` only. Empty matches every note under the vault root.
     #[arg(long, env = "ANWESEN_QUERY", default_value = "")]
     pub query: String,
 
-    /// Log verbosity. Logs go to stderr; the merged document goes to stdout.
+    /// Log verbosity. Logs go to stderr; the document goes to stdout.
     #[arg(long, env = "ANWESEN_LOG_LEVEL", default_value = "info")]
     pub log_level: LogLevel,
 }
@@ -268,6 +278,47 @@ mod tests {
     fn merge_rejects_bind() {
         // --bind is serve-only; merge must not accept it.
         let err = parse(&["merge", "--vault", "/tmp/v", "--bind", "0.0.0.0:9000"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn query_takes_the_same_flags_as_merge() {
+        let cli = parse(&[
+            "query",
+            "--vault",
+            "/tmp/v",
+            "--query",
+            "tags=anwesen&__anw-limit=5",
+            "--log-level",
+            "warn",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Query(a) => {
+                assert_eq!(a.vault, PathBuf::from("/tmp/v"));
+                assert_eq!(a.query, "tags=anwesen&__anw-limit=5");
+                assert!(matches!(a.log_level, LogLevel::Warn));
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn query_requires_vault_and_defaults_the_query() {
+        assert!(parse(&["query"]).is_err());
+        match parse(&["query", "--vault", "/tmp/v"])
+            .expect("parse")
+            .command
+        {
+            Command::Query(a) => assert_eq!(a.query, ""),
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn query_rejects_bind() {
+        // --bind is serve-only; query does not listen.
+        let err = parse(&["query", "--vault", "/tmp/v", "--bind", "0.0.0.0:9000"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 

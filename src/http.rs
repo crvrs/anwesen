@@ -22,7 +22,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use http_body::Body as _;
 use hydra::Process;
 use serde::Serialize;
@@ -32,16 +32,10 @@ use std::path::PathBuf;
 
 use crate::app::RestartCounters;
 use crate::health::HealthState;
+use crate::query::rfc3339_z;
 use crate::store::NoteStore;
 use crate::telemetry::{self, Telemetry, TraceHeaders};
 use crate::vault::{Note, frontmatter_to_json};
-
-/// Canonical RFC 3339 form with a `Z` suffix -- the shape the User Manual
-/// example uses for `last_modified`. Centralized here so every HTTP
-/// `last_modified` field stays in the same dialect.
-fn rfc3339_z(dt: DateTime<Utc>) -> String {
-    dt.to_rfc3339_opts(SecondsFormat::Secs, true)
-}
 
 /// Shared state injected into every handler.
 #[derive(Clone)]
